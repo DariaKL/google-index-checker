@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: google-index-checker
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"

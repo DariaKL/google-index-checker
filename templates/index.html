@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Перевірка індексації Google</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; color: #333; min-height: 100vh; }
+
+        .container { max-width: 1100px; margin: 0 auto; padding: 20px; }
+
+        h1 { text-align: center; color: #1a237e; margin: 20px 0 6px; font-size: 1.8em; }
+        .subtitle { text-align: center; color: #888; margin-bottom: 20px; font-size: 0.9em; }
+
+        .card { background: #fff; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 20px; margin-bottom: 16px; }
+        .card h2 { font-size: 1.1em; color: #1a237e; margin-bottom: 12px; }
+
+        textarea { width: 100%; height: 160px; border: 2px solid #e0e0e0; border-radius: 8px; padding: 12px; font-family: 'Consolas', monospace; font-size: 13px; resize: vertical; transition: border-color 0.2s; }
+        textarea:focus { outline: none; border-color: #1e88e5; }
+
+        .file-row { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; }
+        .file-row input[type="file"] { flex: 1; }
+        .hint { color: #999; font-size: 0.8em; margin-top: 4px; }
+
+        .settings { display: flex; gap: 20px; flex-wrap: wrap; align-items: center; }
+        .settings label { font-size: 0.9em; color: #555; }
+        .settings input, .settings select { padding: 6px 10px; border: 2px solid #e0e0e0; border-radius: 6px; font-size: 0.9em; }
+        .settings input:focus, .settings select:focus { outline: none; border-color: #1e88e5; }
+
+        .btn-row { display: flex; gap: 10px; margin-bottom: 16px; }
+        .btn { padding: 12px 28px; border: none; border-radius: 8px; font-size: 1em; font-weight: 600; cursor: pointer; transition: all 0.2s; color: #fff; }
+        .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+        .btn-start { background: #43a047; flex: 1; }
+        .btn-stop { background: #e53935; }
+        .btn-export { background: #1e88e5; }
+
+        .progress-wrap { margin-bottom: 16px; }
+        .progress-bar { width: 100%; height: 8px; background: #e0e0e0; border-radius: 4px; overflow: hidden; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #43a047, #66bb6a); width: 0%; transition: width 0.3s; border-radius: 4px; }
+        .progress-text { font-size: 0.85em; color: #777; margin-top: 4px; }
+
+        .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+        .stat { padding: 8px 16px; border-radius: 8px; font-size: 0.9em; font-weight: 600; }
+        .stat-total { background: #e8eaf6; color: #1a237e; }
+        .stat-indexed { background: #c8e6c9; color: #1b5e20; }
+        .stat-not { background: #ffcdd2; color: #b71c1c; }
+        .stat-blocked { background: #fff3e0; color: #e65100; }
+        .stat-error { background: #fff9c4; color: #f57f17; }
+
+        table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+        th { background: #1a237e; color: #fff; padding: 10px 12px; text-align: left; position: sticky; top: 0; }
+        th:first-child { width: 50px; text-align: center; border-radius: 8px 0 0 0; }
+        th:last-child { border-radius: 0 8px 0 0; }
+        td { padding: 8px 12px; border-bottom: 1px solid #eee; }
+        td:first-child { text-align: center; }
+        tr:hover { background: #f8f9ff; }
+
+        .table-wrap { max-height: 500px; overflow-y: auto; border-radius: 8px; border: 1px solid #e0e0e0; }
+
+        .row-indexed { background: #e8f5e9; }
+        .row-not_indexed { background: #ffebee; }
+        .row-blocked { background: #fff8e1; }
+        .row-error { background: #fffde7; }
+
+        .status-badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.85em; font-weight: 600; }
+        .badge-indexed { background: #43a047; color: #fff; }
+        .badge-not_indexed { background: #e53935; color: #fff; }
+        .badge-blocked { background: #ff9800; color: #fff; }
+        .badge-error { background: #fdd835; color: #333; }
+
+        .url-cell { max-width: 350px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .url-cell a { color: #1565c0; text-decoration: none; }
+        .url-cell a:hover { text-decoration: underline; }
+
+        .empty-msg { text-align: center; color: #bbb; padding: 40px; font-size: 1.1em; }
+
+        @media (max-width: 768px) {
+            .container { padding: 10px; }
+            .settings { flex-direction: column; gap: 10px; }
+            .btn-row { flex-direction: column; }
+            .btn { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Перевірка індексації Google</h1>
+        <p class="subtitle">Перевіряє чи сторінки є в індексі Google через запит site:URL</p>
+
+        <!-- URL Input -->
+        <div class="card">
+            <h2>1) Список URL</h2>
+            <div class="file-row">
+                <input type="file" id="fileInput" accept=".txt,.csv,.xlsx">
+            </div>
+            <textarea id="urlInput" placeholder="Вставте URL по одному в рядку, або завантажте файл вище&#10;&#10;https://example.com&#10;https://example.com/page1&#10;https://example.com/page2"></textarea>
+            <p class="hint">Підтримуються файли .txt, .csv, .xlsx (перша колонка)</p>
+        </div>
+
+        <!-- Settings -->
+        <div class="card">
+            <h2>2) Налаштування</h2>
+            <div class="settings">
+                <div>
+                    <label for="delay">Пауза між запитами (мс):</label>
+                    <input type="number" id="delay" value="3000" min="500" max="60000" step="500">
+                </div>
+                <div>
+                    <label for="lang">Мова (hl):</label>
+                    <input type="text" id="lang" value="uk" style="width:60px">
+                </div>
+            </div>
+        </div>
+
+        <!-- Buttons -->
+        <div class="btn-row">
+            <button class="btn btn-start" id="btnStart" onclick="startCheck()">&#9654; Старт</button>
+            <button class="btn btn-stop" id="btnStop" onclick="stopCheck()" disabled>&#9632; Стоп</button>
+            <button class="btn btn-export" id="btnExportCsv" onclick="exportResults('csv')" disabled>&#8595; CSV</button>
+            <button class="btn btn-export" id="btnExportXlsx" onclick="exportResults('xlsx')" disabled>&#8595; XLSX</button>
+        </div>
+
+        <!-- Progress -->
+        <div class="progress-wrap">
+            <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+            <p class="progress-text" id="progressText">Готово. Введіть URL і натисніть «Старт».</p>
+        </div>
+
+        <!-- Stats -->
+        <div class="stats" id="stats" style="display:none">
+            <span class="stat stat-total" id="statTotal">Перевірено: 0</span>
+            <span class="stat stat-indexed" id="statIndexed">✓ В індексі: 0</span>
+            <span class="stat stat-not" id="statNot">✗ Не в індексі: 0</span>
+            <span class="stat stat-blocked" id="statBlocked">⛔ Заблоковано: 0</span>
+            <span class="stat stat-error" id="statError">⚠ Помилки: 0</span>
+        </div>
+
+        <!-- Results -->
+        <div class="card">
+            <h2>Результати</h2>
+            <div class="table-wrap" id="tableWrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>№</th>
+                            <th>URL</th>
+                            <th>Статус</th>
+                            <th>Заголовок</th>
+                            <th>Коментар</th>
+                        </tr>
+                    </thead>
+                    <tbody id="resultsBody">
+                    </tbody>
+                </table>
+                <p class="empty-msg" id="emptyMsg">Результатів поки немає</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ── Globals ──
+        let currentTaskId = null;
+        let eventSource = null;
+        let counts = { total: 0, indexed: 0, not_indexed: 0, blocked: 0, error: 0 };
+
+        const statusLabels = {
+            indexed: '✓ В індексі',
+            not_indexed: '✗ Не в індексі',
+            blocked: '⛔ Заблоковано',
+            error: '⚠ Помилка'
+        };
+        const badgeClass = {
+            indexed: 'badge-indexed',
+            not_indexed: 'badge-not_indexed',
+            blocked: 'badge-blocked',
+            error: 'badge-error'
+        };
+
+        // ── File upload ──
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const ext = file.name.split('.').pop().toLowerCase();
+
+            if (ext === 'txt' || ext === 'csv') {
+                const reader = new FileReader();
+                reader.onload = function(ev) {
+                    document.getElementById('urlInput').value = ev.target.result;
+                };
+                reader.readAsText(file);
+            } else if (ext === 'xlsx') {
+                // Read xlsx via simple fetch to avoid adding SheetJS
+                const formData = new FormData();
+                formData.append('file', file);
+                // For xlsx, just show a message and let user paste manually
+                alert('Для .xlsx файлів скопіюйте URL вручну або конвертуйте у .txt/.csv');
+            }
+        });
+
+        // ── Start ──
+        function startCheck() {
+            const urls = document.getElementById('urlInput').value.trim();
+            if (!urls) {
+                alert('Будь ласка, введіть хоча б один URL');
+                return;
+            }
+
+            const delay = document.getElementById('delay').value;
+            const lang = document.getElementById('lang').value;
+
+            // Reset
+            document.getElementById('resultsBody').innerHTML = '';
+            document.getElementById('emptyMsg').style.display = 'none';
+            document.getElementById('progressFill').style.width = '0%';
+            counts = { total: 0, indexed: 0, not_indexed: 0, blocked: 0, error: 0 };
+            updateStats();
+            document.getElementById('stats').style.display = 'flex';
+
+            setButtons(true);
+
+            fetch('/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ urls, delay, lang })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    alert(data.error);
+                    setButtons(false);
+                    return;
+                }
+                currentTaskId = data.task_id;
+                document.getElementById('progressText').textContent = `Запуск Chrome... (${data.total} URL)`;
+                listenEvents(data.task_id);
+            })
+            .catch(err => {
+                alert('Помилка: ' + err);
+                setButtons(false);
+            });
+        }
+
+        // ── SSE listener ──
+        function listenEvents(taskId) {
+            if (eventSource) eventSource.close();
+
+            eventSource = new EventSource('/events/' + taskId);
+
+            eventSource.onmessage = function(e) {
+                const data = JSON.parse(e.data);
+
+                if (data.type === 'result') {
+                    addRow(data.row);
+                    const pct = (data.current / data.total * 100).toFixed(1);
+                    document.getElementById('progressFill').style.width = pct + '%';
+                    document.getElementById('progressText').textContent =
+                        `Перевірка ${data.current}/${data.total}: ${data.row.url.substring(0, 70)}`;
+
+                    counts.total++;
+                    if (data.row.status === 'indexed') counts.indexed++;
+                    else if (data.row.status === 'not_indexed') counts.not_indexed++;
+                    else if (data.row.status === 'blocked') counts.blocked++;
+                    else counts.error++;
+                    updateStats();
+                }
+                else if (data.type === 'error') {
+                    document.getElementById('progressText').textContent = data.message;
+                }
+                else if (data.type === 'done') {
+                    eventSource.close();
+                    eventSource = null;
+                    setButtons(false);
+                    document.getElementById('progressFill').style.width = '100%';
+                    document.getElementById('progressText').textContent =
+                        `Готово! Перевірено: ${counts.total} | ✓ ${counts.indexed} | ✗ ${counts.not_indexed} | ⛔ ${counts.blocked} | ⚠ ${counts.error}`;
+                }
+            };
+
+            eventSource.onerror = function() {
+                eventSource.close();
+                eventSource = null;
+                setButtons(false);
+            };
+        }
+
+        // ── Stop ──
+        function stopCheck() {
+            if (currentTaskId) {
+                fetch('/stop/' + currentTaskId, { method: 'POST' });
+            }
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            setButtons(false);
+            document.getElementById('progressText').textContent = 'Зупинено користувачем.';
+        }
+
+        // ── Export ──
+        function exportResults(fmt) {
+            if (currentTaskId) {
+                window.location.href = '/export/' + currentTaskId + '/' + fmt;
+            }
+        }
+
+        // ── Helpers ──
+        function setButtons(running) {
+            document.getElementById('btnStart').disabled = running;
+            document.getElementById('btnStop').disabled = !running;
+            document.getElementById('btnExportCsv').disabled = running || counts.total === 0;
+            document.getElementById('btnExportXlsx').disabled = running || counts.total === 0;
+        }
+
+        function addRow(row) {
+            const tbody = document.getElementById('resultsBody');
+            const tr = document.createElement('tr');
+            tr.className = 'row-' + row.status;
+
+            const label = statusLabels[row.status] || row.status;
+            const badge = badgeClass[row.status] || 'badge-error';
+
+            tr.innerHTML = `
+                <td>${row.num}</td>
+                <td class="url-cell"><a href="${escHtml(row.url)}" target="_blank" rel="noopener">${escHtml(row.url)}</a></td>
+                <td><span class="status-badge ${badge}">${label}</span></td>
+                <td>${escHtml(row.title)}</td>
+                <td>${escHtml(row.comment)}</td>
+            `;
+            tbody.appendChild(tr);
+
+            // Auto-scroll
+            const wrap = document.getElementById('tableWrap');
+            wrap.scrollTop = wrap.scrollHeight;
+        }
+
+        function updateStats() {
+            document.getElementById('statTotal').textContent = 'Перевірено: ' + counts.total;
+            document.getElementById('statIndexed').textContent = '✓ В індексі: ' + counts.indexed;
+            document.getElementById('statNot').textContent = '✗ Не в індексі: ' + counts.not_indexed;
+            document.getElementById('statBlocked').textContent = '⛔ Заблоковано: ' + counts.blocked;
+            document.getElementById('statError').textContent = '⚠ Помилки: ' + counts.error;
+        }
+
+        function escHtml(str) {
+            if (!str) return '';
+            return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+    </script>
+</body>
+</html>
