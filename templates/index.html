@@ -76,6 +76,9 @@
 
         .empty-msg { text-align: center; color: #bbb; padding: 40px; font-size: 1.1em; }
 
+        .btn-google { display: inline-block; padding: 4px 10px; background: #4285f4; color: #fff; border-radius: 6px; font-size: 0.8em; font-weight: 600; text-decoration: none; white-space: nowrap; transition: background 0.2s; }
+        .btn-google:hover { background: #3367d6; text-decoration: none; }
+
         @media (max-width: 768px) {
             .container { padding: 10px; }
             .settings { flex-direction: column; gap: 10px; }
@@ -149,6 +152,7 @@
                             <th>Статус</th>
                             <th>Заголовок</th>
                             <th>Коментар</th>
+                            <th>Перевірити</th>
                         </tr>
                     </thead>
                     <tbody id="resultsBody">
@@ -322,12 +326,14 @@
             const label = statusLabels[row.status] || row.status;
             const badge = badgeClass[row.status] || 'badge-error';
 
+            const googleUrl = 'https://www.google.com/search?q=site:' + encodeURIComponent(row.url);
             tr.innerHTML = `
                 <td>${row.num}</td>
                 <td class="url-cell"><a href="${escHtml(row.url)}" target="_blank" rel="noopener">${escHtml(row.url)}</a></td>
                 <td><span class="status-badge ${badge}">${label}</span></td>
                 <td>${escHtml(row.title)}</td>
                 <td>${escHtml(row.comment)}</td>
+                <td><a href="${escHtml(googleUrl)}" target="_blank" rel="noopener" class="btn-google">🔍 Google</a></td>
             `;
             tbody.appendChild(tr);
 
