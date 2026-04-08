@@ -183,6 +183,24 @@ def start_check():
     return jsonify({"task_id": task.id, "total": len(urls)})
 
 
+@app.route("/save-results", methods=["POST"])
+def save_results():
+    """Save manually checked results for export."""
+    data = request.get_json()
+    results = data.get("results", [])
+    if not results:
+        return jsonify({"error": "No results"}), 400
+
+    task = CheckTask([], 0, "uk")
+    task.results = results
+    task.status = "done"
+
+    with tasks_lock:
+        tasks[task.id] = task
+
+    return jsonify({"task_id": task.id})
+
+
 @app.route("/stop/<task_id>", methods=["POST"])
 def stop_check(task_id):
     with tasks_lock:

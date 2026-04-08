@@ -50,7 +50,7 @@
         .stat-error { background: #fff9c4; color: #f57f17; }
 
         table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
-        th { background: #1a237e; color: #fff; padding: 10px 12px; text-align: left; position: sticky; top: 0; }
+        th { background: #1a237e; color: #fff; padding: 10px 12px; text-align: left; position: sticky; top: 0; z-index: 1; }
         th:first-child { width: 50px; text-align: center; border-radius: 8px 0 0 0; }
         th:last-child { border-radius: 0 8px 0 0; }
         td { padding: 8px 12px; border-bottom: 1px solid #eee; }
@@ -76,21 +76,49 @@
 
         .empty-msg { text-align: center; color: #bbb; padding: 40px; font-size: 1.1em; }
 
-        .btn-google { display: inline-block; padding: 4px 10px; background: #4285f4; color: #fff; border-radius: 6px; font-size: 0.8em; font-weight: 600; text-decoration: none; white-space: nowrap; transition: background 0.2s; }
-        .btn-google:hover { background: #3367d6; text-decoration: none; }
+        /* ── Decision panel ── */
+        .decision-overlay {
+            display: none;
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5); z-index: 1000;
+            justify-content: center; align-items: flex-start; padding-top: 60px;
+        }
+        .decision-overlay.active { display: flex; }
+        .decision-panel {
+            background: #fff; border-radius: 14px; box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+            padding: 28px 32px; max-width: 600px; width: 90%; text-align: center;
+        }
+        .decision-panel h3 { color: #1a237e; margin-bottom: 8px; font-size: 1.2em; }
+        .decision-url {
+            font-family: 'Consolas', monospace; font-size: 0.85em; color: #1565c0;
+            word-break: break-all; margin-bottom: 16px; padding: 10px;
+            background: #f5f5f5; border-radius: 8px;
+        }
+        .decision-hint {
+            color: #777; font-size: 0.85em; margin-bottom: 18px;
+        }
+        .decision-buttons { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+        .decision-buttons .btn { font-size: 0.95em; padding: 12px 20px; min-width: 140px; }
+        .btn-indexed { background: #43a047; }
+        .btn-not-indexed { background: #e53935; }
+        .btn-captcha { background: #ff9800; }
+        .btn-skip { background: #78909c; }
+        .decision-counter { color: #999; font-size: 0.8em; margin-top: 14px; }
 
         @media (max-width: 768px) {
             .container { padding: 10px; }
             .settings { flex-direction: column; gap: 10px; }
             .btn-row { flex-direction: column; }
             .btn { width: 100%; }
+            .decision-buttons { flex-direction: column; }
+            .decision-buttons .btn { width: 100%; }
         }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Перевірка індексації Google</h1>
-        <p class="subtitle">Перевіряє чи сторінки є в індексі Google через запит site:URL</p>
+        <p class="subtitle">Відкриває Google пошук site:URL — ви перевіряєте результат і проходите CAPTCHA, якщо потрібно</p>
 
         <!-- URL Input -->
         <div class="card">
@@ -106,10 +134,6 @@
         <div class="card">
             <h2>2) Налаштування</h2>
             <div class="settings">
-                <div>
-                    <label for="delay">Пауза між запитами (мс):</label>
-                    <input type="number" id="delay" value="500" min="200" max="60000" step="100">
-                </div>
                 <div>
                     <label for="lang">Мова (hl):</label>
                     <input type="text" id="lang" value="uk" style="width:60px">
@@ -150,9 +174,7 @@
                             <th>№</th>
                             <th>URL</th>
                             <th>Статус</th>
-                            <th>Заголовок</th>
                             <th>Коментар</th>
-                            <th>Перевірити</th>
                         </tr>
                     </thead>
                     <tbody id="resultsBody">
@@ -163,32 +185,55 @@
         </div>
     </div>
 
+    <!-- Decision overlay -->
+    <div class="decision-overlay" id="decisionOverlay">
+        <div class="decision-panel">
+            <h3>🔍 Перевірте результат у вікні Google</h3>
+            <div class="decision-url" id="decisionUrl"></div>
+            <div class="decision-hint">
+                Подивіться на відкрите вікно Google. Якщо бачите CAPTCHA — пройдіть її, потім натисніть «🔄 Повторити».<br>
+                Якщо бачите результати — натисніть відповідну кнопку.
+            </div>
+            <div class="decision-buttons">
+                <button class="btn btn-indexed" onclick="decide('indexed')">✓ В індексі</button>
+                <button class="btn btn-not-indexed" onclick="decide('not_indexed')">✗ Не в індексі</button>
+                <button class="btn btn-captcha" onclick="decide('retry')">🔄 Повторити</button>
+                <button class="btn btn-skip" onclick="decide('skip')">⏭ Пропустити</button>
+            </div>
+            <div class="decision-counter" id="decisionCounter"></div>
+        </div>
+    </div>
+
     <script>
         // ── Globals ──
         let currentTaskId = null;
-        let eventSource = null;
+        let allResults = [];
+        let urlList = [];
+        let currentIndex = 0;
+        let googlePopup = null;
+        let stopped = false;
         let counts = { total: 0, indexed: 0, not_indexed: 0, blocked: 0, error: 0 };
 
         const statusLabels = {
             indexed: '✓ В індексі',
             not_indexed: '✗ Не в індексі',
             blocked: '⛔ Заблоковано',
-            error: '⚠ Помилка'
+            error: '⚠ Помилка',
+            skip: '⏭ Пропущено'
         };
         const badgeClass = {
             indexed: 'badge-indexed',
             not_indexed: 'badge-not_indexed',
             blocked: 'badge-blocked',
-            error: 'badge-error'
+            error: 'badge-error',
+            skip: 'badge-error'
         };
 
         // ── File upload ──
         document.getElementById('fileInput').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (!file) return;
-
             const ext = file.name.split('.').pop().toLowerCase();
-
             if (ext === 'txt' || ext === 'csv') {
                 const reader = new FileReader();
                 reader.onload = function(ev) {
@@ -196,110 +241,156 @@
                 };
                 reader.readAsText(file);
             } else if (ext === 'xlsx') {
-                // Read xlsx via simple fetch to avoid adding SheetJS
-                const formData = new FormData();
-                formData.append('file', file);
-                // For xlsx, just show a message and let user paste manually
                 alert('Для .xlsx файлів скопіюйте URL вручну або конвертуйте у .txt/.csv');
             }
         });
 
+        // ── Parse URLs ──
+        function parseUrls(text) {
+            return text.split('\n')
+                .map(l => l.trim())
+                .filter(l => l && (l.startsWith('http://') || l.startsWith('https://') || l.includes('.')));
+        }
+
         // ── Start ──
         function startCheck() {
-            const urls = document.getElementById('urlInput').value.trim();
-            if (!urls) {
-                alert('Будь ласка, введіть хоча б один URL');
-                return;
-            }
+            const text = document.getElementById('urlInput').value.trim();
+            if (!text) { alert('Будь ласка, введіть хоча б один URL'); return; }
 
-            const delay = document.getElementById('delay').value;
-            const lang = document.getElementById('lang').value;
+            urlList = parseUrls(text);
+            if (!urlList.length) { alert('Не знайдено жодного валідного URL'); return; }
 
             // Reset
+            allResults = [];
+            currentIndex = 0;
+            stopped = false;
             document.getElementById('resultsBody').innerHTML = '';
             document.getElementById('emptyMsg').style.display = 'none';
             document.getElementById('progressFill').style.width = '0%';
             counts = { total: 0, indexed: 0, not_indexed: 0, blocked: 0, error: 0 };
             updateStats();
             document.getElementById('stats').style.display = 'flex';
-
             setButtons(true);
 
-            fetch('/start', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ urls, delay, lang })
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.error) {
-                    alert(data.error);
-                    setButtons(false);
-                    return;
-                }
-                currentTaskId = data.task_id;
-                document.getElementById('progressText').textContent = `Запуск Chrome... (${data.total} URL)`;
-                listenEvents(data.task_id);
-            })
-            .catch(err => {
-                alert('Помилка: ' + err);
-                setButtons(false);
-            });
+            document.getElementById('progressText').textContent =
+                `Перевірка: 0/${urlList.length}. Дозвольте popup-вікна якщо браузер запитає!`;
+
+            processNext();
         }
 
-        // ── SSE listener ──
-        function listenEvents(taskId) {
-            if (eventSource) eventSource.close();
+        // ── Process next URL ──
+        function processNext() {
+            if (stopped || currentIndex >= urlList.length) {
+                finish();
+                return;
+            }
 
-            eventSource = new EventSource('/events/' + taskId);
+            const url = urlList[currentIndex];
+            const lang = document.getElementById('lang').value || 'uk';
+            const clean = url.startsWith('http') ? url : 'https://' + url;
+            const googleUrl = 'https://www.google.com/search?q=site:' + encodeURIComponent(clean) + '&hl=' + encodeURIComponent(lang);
 
-            eventSource.onmessage = function(e) {
-                const data = JSON.parse(e.data);
+            // Update progress
+            document.getElementById('progressText').textContent =
+                `Перевірка ${currentIndex + 1}/${urlList.length}: ${url.substring(0, 70)}`;
+            const pct = (currentIndex / urlList.length * 100).toFixed(1);
+            document.getElementById('progressFill').style.width = pct + '%';
 
-                if (data.type === 'result') {
-                    addRow(data.row);
-                    const pct = (data.current / data.total * 100).toFixed(1);
-                    document.getElementById('progressFill').style.width = pct + '%';
-                    document.getElementById('progressText').textContent =
-                        `Перевірка ${data.current}/${data.total}: ${data.row.url.substring(0, 70)}`;
+            // Show decision panel
+            document.getElementById('decisionUrl').textContent = url;
+            document.getElementById('decisionCounter').textContent =
+                `URL ${currentIndex + 1} з ${urlList.length}`;
+            document.getElementById('decisionOverlay').classList.add('active');
 
-                    counts.total++;
-                    if (data.row.status === 'indexed') counts.indexed++;
-                    else if (data.row.status === 'not_indexed') counts.not_indexed++;
-                    else if (data.row.status === 'blocked') counts.blocked++;
-                    else counts.error++;
-                    updateStats();
+            // Open Google popup
+            if (googlePopup && !googlePopup.closed) {
+                googlePopup.location.href = googleUrl;
+            } else {
+                googlePopup = window.open(googleUrl, 'googleCheck',
+                    'width=1000,height=700,scrollbars=yes,resizable=yes');
+            }
+
+            if (!googlePopup || googlePopup.closed) {
+                alert('Браузер заблокував popup-вікно! Дозвольте popup-вікна для цього сайту і натисніть Старт знову.');
+                finish();
+            }
+        }
+
+        // ── User decision ──
+        function decide(status) {
+            if (status === 'retry') {
+                // Re-open same URL
+                const url = urlList[currentIndex];
+                const lang = document.getElementById('lang').value || 'uk';
+                const clean = url.startsWith('http') ? url : 'https://' + url;
+                const googleUrl = 'https://www.google.com/search?q=site:' + encodeURIComponent(clean) + '&hl=' + encodeURIComponent(lang);
+                if (googlePopup && !googlePopup.closed) {
+                    googlePopup.location.href = googleUrl;
+                } else {
+                    googlePopup = window.open(googleUrl, 'googleCheck',
+                        'width=1000,height=700,scrollbars=yes,resizable=yes');
                 }
-                else if (data.type === 'error') {
-                    document.getElementById('progressText').textContent = data.message;
-                }
-                else if (data.type === 'done') {
-                    eventSource.close();
-                    eventSource = null;
-                    setButtons(false);
-                    document.getElementById('progressFill').style.width = '100%';
-                    document.getElementById('progressText').textContent =
-                        `Готово! Перевірено: ${counts.total} | ✓ ${counts.indexed} | ✗ ${counts.not_indexed} | ⛔ ${counts.blocked} | ⚠ ${counts.error}`;
-                }
+                return;
+            }
+
+            const url = urlList[currentIndex];
+            const commentMap = {
+                indexed: 'В індексі Google (підтверджено вручну)',
+                not_indexed: 'Не знайдено в індексі Google',
+                skip: 'Пропущено користувачем'
             };
 
-            eventSource.onerror = function() {
-                eventSource.close();
-                eventSource = null;
-                setButtons(false);
+            const row = {
+                num: currentIndex + 1,
+                url: url,
+                status: status,
+                title: '',
+                comment: commentMap[status] || ''
             };
+
+            allResults.push(row);
+            addRow(row);
+
+            counts.total++;
+            if (status === 'indexed') counts.indexed++;
+            else if (status === 'not_indexed') counts.not_indexed++;
+            else if (status === 'blocked') counts.blocked++;
+            else counts.error++;
+            updateStats();
+
+            currentIndex++;
+            processNext();
+        }
+
+        // ── Finish ──
+        function finish() {
+            document.getElementById('decisionOverlay').classList.remove('active');
+            if (googlePopup && !googlePopup.closed) googlePopup.close();
+            googlePopup = null;
+
+            setButtons(false);
+            document.getElementById('progressFill').style.width = '100%';
+            document.getElementById('progressText').textContent =
+                `Готово! Перевірено: ${counts.total} | ✓ ${counts.indexed} | ✗ ${counts.not_indexed} | ⛔ ${counts.blocked} | ⚠ ${counts.error}`;
+
+            // Save results to server for export
+            if (allResults.length > 0) {
+                fetch('/save-results', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ results: allResults })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.task_id) currentTaskId = data.task_id;
+                });
+            }
         }
 
         // ── Stop ──
         function stopCheck() {
-            if (currentTaskId) {
-                fetch('/stop/' + currentTaskId, { method: 'POST' });
-            }
-            if (eventSource) {
-                eventSource.close();
-                eventSource = null;
-            }
-            setButtons(false);
+            stopped = true;
+            finish();
             document.getElementById('progressText').textContent = 'Зупинено користувачем.';
         }
 
@@ -326,18 +417,14 @@
             const label = statusLabels[row.status] || row.status;
             const badge = badgeClass[row.status] || 'badge-error';
 
-            const googleUrl = 'https://www.google.com/search?q=site:' + encodeURIComponent(row.url);
             tr.innerHTML = `
                 <td>${row.num}</td>
                 <td class="url-cell"><a href="${escHtml(row.url)}" target="_blank" rel="noopener">${escHtml(row.url)}</a></td>
                 <td><span class="status-badge ${badge}">${label}</span></td>
-                <td>${escHtml(row.title)}</td>
                 <td>${escHtml(row.comment)}</td>
-                <td><a href="${escHtml(googleUrl)}" target="_blank" rel="noopener" class="btn-google">🔍 Google</a></td>
             `;
             tbody.appendChild(tr);
 
-            // Auto-scroll
             const wrap = document.getElementById('tableWrap');
             wrap.scrollTop = wrap.scrollHeight;
         }
