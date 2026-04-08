@@ -59,10 +59,34 @@ class CheckTask:
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/146.0.0.0 Safari/537.36",
+                  "Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.google.com/",
 }
+
+# Persistent session — keeps cookies (consent bypass) across requests
+_google_session = http_requests.Session()
+_google_session.headers.update(HEADERS)
+_google_session.cookies.set("CONSENT", "YES+cb.20231008-08-p0.uk+FX+684",
+                            domain=".google.com")
+_google_session.cookies.set("SOCS",
+                            "CAISHAgBEhJnd3NfMjAyMzEwMDgtMF9SQzIaAmVuIAEaBgiA0JyaBg",
+                            domain=".google.com")
+
+
+def _do_google_request(search_url):
+    """Send request via persistent session; handle consent redirect automatically."""
+    r = _google_session.get(search_url, timeout=15, allow_redirects=True)
+
+    # If Google redirected to consent page — set cookies and retry once
+    if "consent.google" in r.url or "consent.youtube" in r.url:
+        _google_session.cookies.set("CONSENT",
+                                    "YES+cb.20231008-08-p0.uk+FX+684",
+                                    domain=".google.com")
+        r = _google_session.get(search_url, timeout=15, allow_redirects=True)
+
+    return r
 
 
 def check_indexed_scrape(url, lang="uk"):
@@ -79,14 +103,14 @@ def check_indexed_scrape(url, lang="uk"):
     search_url = f"https://www.google.com/search?q={quote(query)}&num=10&hl={quote(lang)}"
 
     try:
-        r = http_requests.get(search_url, headers=HEADERS, timeout=15)
+        r = _do_google_request(search_url)
     except http_requests.Timeout:
         return "error", "", "Таймаут запиту до Google"
     except Exception as e:
         return "error", "", f"Помилка: {str(e)[:120]}"
 
     if r.status_code == 429:
-        return "blocked", "", "CAPTCHA — занадто багато запитів"
+        return "blocked", "", "CAPTCHA — занадто багато запитів (429)"
 
     if r.status_code != 200:
         return "error", "", f"HTTP {r.status_code}"
@@ -95,16 +119,18 @@ def check_indexed_scrape(url, lang="uk"):
     soup = BeautifulSoup(html, "html.parser")
     plain = soup.get_text(" ", strip=True).lower()
 
-    # ── CAPTCHA / consent detection ──
+    # ── Real CAPTCHA detection (NOT consent page) ──
     current_url = r.url
-    if (
-        "/sorry/" in current_url
-        or "consent.google" in current_url
-        or "captcha" in plain
-        or "unusual traffic" in plain
-        or "before you continue" in plain
-    ):
+    if "/sorry/" in current_url:
         return "blocked", "", "CAPTCHA — пройдіть вручну"
+    if "unusual traffic" in plain or "our systems have detected unusual" in plain:
+        return "blocked", "", "CAPTCHA — Google виявив незвичний трафік"
+
+    # Consent page that cookies didn't fix — not a CAPTCHA, just retry-able
+    if "consent.google" in current_url or (
+        "before you continue" in plain and len(plain) < 500
+    ):
+        return "error", "", "Google показав сторінку згоди — спробуйте ще раз"
 
     def first_h3():
         h3 = soup.find("h3")
