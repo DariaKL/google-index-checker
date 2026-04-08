@@ -56,35 +56,61 @@ class CheckTask:
 
 # ── Google scraping check (like desktop version) ──
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": "https://www.google.com/",
-}
+import random as _rnd
 
-# Persistent session — keeps cookies (consent bypass) across requests
-_google_session = http_requests.Session()
-_google_session.headers.update(HEADERS)
-_google_session.cookies.set("CONSENT", "YES+cb.20231008-08-p0.uk+FX+684",
-                            domain=".google.com")
-_google_session.cookies.set("SOCS",
-                            "CAISHAgBEhJnd3NfMjAyMzEwMDgtMF9SQzIaAmVuIAEaBgiA0JyaBg",
-                            domain=".google.com")
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
 
 
-def _do_google_request(search_url):
-    """Send request via persistent session; handle consent redirect automatically."""
-    r = _google_session.get(search_url, timeout=15, allow_redirects=True)
+def _make_session():
+    """Create a requests session that looks like a real Chrome browser."""
+    s = http_requests.Session()
+    ua = _rnd.choice(_USER_AGENTS)
+    s.headers.update({
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://www.google.com/",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+    })
+    # Pre-set consent cookies to bypass GDPR page
+    s.cookies.set("CONSENT", "YES+cb.20231008-08-p0.uk+FX+684", domain=".google.com")
+    s.cookies.set("SOCS", "CAISHAgBEhJnd3NfMjAyMzEwMDgtMF9SQzIaAmVuIAEaBgiA0JyaBg",
+                  domain=".google.com")
+    return s
 
-    # If Google redirected to consent page — set cookies and retry once
-    if "consent.google" in r.url or "consent.youtube" in r.url:
-        _google_session.cookies.set("CONSENT",
-                                    "YES+cb.20231008-08-p0.uk+FX+684",
-                                    domain=".google.com")
+
+_google_session = _make_session()
+
+
+def _do_google_request(search_url, retry=True):
+    """Send request via persistent session; retry once with new session on failure."""
+    global _google_session
+    try:
         r = _google_session.get(search_url, timeout=15, allow_redirects=True)
+    except Exception:
+        if retry:
+            _google_session = _make_session()
+            return _do_google_request(search_url, retry=False)
+        raise
+
+    # If consent redirect — reset session & retry once
+    if retry and ("consent.google" in r.url or r.status_code == 429
+                  or "/sorry/" in r.url):
+        _google_session = _make_session()
+        time.sleep(_rnd.uniform(1, 3))
+        return _do_google_request(search_url, retry=False)
 
     return r
 
@@ -93,14 +119,17 @@ def check_indexed_scrape(url, lang="uk"):
     """
     Check if URL is indexed by scraping Google Search.
     Returns (status, title, comment)
-    status: "indexed" | "not_indexed" | "blocked" | "error"
+    status: "indexed" | "not_indexed" | "error"
+    "error" covers blocks, CAPTCHAs, consent pages — no popup triggered.
     """
     clean = url.strip()
     if not clean.startswith(("http://", "https://")):
         clean = "https://" + clean
 
     query = f"site:{clean}"
-    search_url = f"https://www.google.com/search?q={quote(query)}&num=10&hl={quote(lang)}"
+    # gbv=1 — basic HTML mode, less blocking
+    search_url = (f"https://www.google.com/search?q={quote(query)}"
+                  f"&num=10&hl={quote(lang)}&gbv=1&pws=0")
 
     try:
         r = _do_google_request(search_url)
@@ -110,7 +139,7 @@ def check_indexed_scrape(url, lang="uk"):
         return "error", "", f"Помилка: {str(e)[:120]}"
 
     if r.status_code == 429:
-        return "blocked", "", "CAPTCHA — занадто багато запитів (429)"
+        return "error", "", "Google обмежив запити (429) — спробуйте пізніше"
 
     if r.status_code != 200:
         return "error", "", f"HTTP {r.status_code}"
@@ -119,18 +148,16 @@ def check_indexed_scrape(url, lang="uk"):
     soup = BeautifulSoup(html, "html.parser")
     plain = soup.get_text(" ", strip=True).lower()
 
-    # ── Real CAPTCHA detection (NOT consent page) ──
+    # ── Blocked / CAPTCHA / consent → treat as error (NO popup) ──
     current_url = r.url
     if "/sorry/" in current_url:
-        return "blocked", "", "CAPTCHA — пройдіть вручну"
+        return "error", "", "Google заблокував запит — потрібна ручна перевірка"
     if "unusual traffic" in plain or "our systems have detected unusual" in plain:
-        return "blocked", "", "CAPTCHA — Google виявив незвичний трафік"
-
-    # Consent page that cookies didn't fix — not a CAPTCHA, just retry-able
+        return "error", "", "Google виявив незвичний трафік — потрібна ручна перевірка"
     if "consent.google" in current_url or (
         "before you continue" in plain and len(plain) < 500
     ):
-        return "error", "", "Google показав сторінку згоди — спробуйте ще раз"
+        return "error", "", "Google показав сторінку згоди — потрібна ручна перевірка"
 
     def first_h3():
         h3 = soup.find("h3")
@@ -215,29 +242,7 @@ def run_check(task):
         except Exception as exc:
             status, title, comment = "error", "", str(exc)[:120]
 
-        # If blocked (CAPTCHA) — ask frontend for manual check
-        if status == "blocked":
-            task.push_event({
-                "type": "need_manual",
-                "num": i + 1,
-                "url": url,
-                "comment": comment,
-                "current": i + 1,
-                "total": task.total,
-            })
-            # Wait for manual result from frontend
-            task.waiting_for_manual.clear()
-            task.manual_result = None
-            task.waiting_for_manual.wait(timeout=300)  # 5 min max
-
-            if task.stop_event.is_set():
-                break
-
-            if task.manual_result:
-                status = task.manual_result.get("status", "blocked")
-                comment = task.manual_result.get("comment", "")
-                title = task.manual_result.get("title", "")
-
+        # No popup — all results (including errors) go straight to frontend
         row = {
             "num": i + 1, "url": url, "status": status,
             "title": title, "comment": comment,
@@ -285,19 +290,25 @@ def start_check():
 
 @app.route("/manual-result/<task_id>", methods=["POST"])
 def manual_result(task_id):
-    """Receive manual check result from frontend when CAPTCHA was shown."""
+    """Receive manual check result from frontend (recheck of error URLs)."""
     with tasks_lock:
         task = tasks.get(task_id)
     if not task:
         return jsonify({"error": "Task not found"}), 404
 
     data = request.get_json()
-    task.manual_result = {
-        "status": data.get("status", "blocked"),
-        "comment": data.get("comment", ""),
-        "title": data.get("title", ""),
-    }
-    task.waiting_for_manual.set()
+    idx = data.get("index")  # 0-based index in results
+    status = data.get("status", "error")
+    comment = data.get("comment", "")
+    title = data.get("title", "")
+
+    # Update existing result if index provided
+    if idx is not None and 0 <= idx < len(task.results):
+        task.results[idx]["status"] = status
+        task.results[idx]["comment"] = comment
+        if title:
+            task.results[idx]["title"] = title
+
     return jsonify({"ok": True})
 
 

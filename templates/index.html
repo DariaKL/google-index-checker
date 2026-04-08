@@ -151,6 +151,7 @@
             <button class="btn btn-stop" id="btnStop" onclick="stopCheck()" disabled>&#9632; Стоп</button>
             <button class="btn btn-export" id="btnExportCsv" onclick="exportResults('csv')" disabled>&#8595; CSV</button>
             <button class="btn btn-export" id="btnExportXlsx" onclick="exportResults('xlsx')" disabled>&#8595; XLSX</button>
+            <button class="btn" id="btnRecheck" onclick="startRecheck()" disabled style="background:#ff9800">&#128269; Перевірити помилки вручну</button>
         </div>
 
         <!-- Progress -->
@@ -164,7 +165,6 @@
             <span class="stat stat-total" id="statTotal">Перевірено: 0</span>
             <span class="stat stat-indexed" id="statIndexed">&#10003; В індексі: 0</span>
             <span class="stat stat-not" id="statNot">&#10007; Не в індексі: 0</span>
-            <span class="stat stat-blocked" id="statBlocked">&#9940; Заблоковано: 0</span>
             <span class="stat stat-error" id="statError">&#9888; Помилки: 0</span>
         </div>
 
@@ -190,14 +190,13 @@
         </div>
     </div>
 
-    <!-- CAPTCHA decision overlay (shown only when server detects CAPTCHA) -->
+    <!-- Manual recheck overlay (shown only when user clicks "Перевірити помилки вручну") -->
     <div class="decision-overlay" id="decisionOverlay">
         <div class="decision-panel">
-            <h3>&#9940; CAPTCHA виявлено!</h3>
+            <h3>&#128269; Ручна перевірка</h3>
             <div class="decision-url" id="decisionUrl"></div>
             <div class="decision-hint">
-                Google показав CAPTCHA. Пройдіть її у відкритому вікні, потім оберіть результат:<br>
-                Якщо бачите результати пошуку — натисніть відповідну кнопку.
+                Перегляньте результат Google у відкритому вікні і оберіть статус:
             </div>
             <div class="decision-buttons">
                 <button class="btn btn-indexed" onclick="sendManual('indexed')">&#10003; В індексі</button>
@@ -214,6 +213,9 @@
         let eventSource = null;
         let googlePopup = null;
         let counts = { total: 0, indexed: 0, not_indexed: 0, blocked: 0, error: 0 };
+        let allResults = [];        // all result rows from SSE
+        let recheckQueue = [];      // indices of error rows to recheck
+        let recheckIdx = 0;         // current position in recheckQueue
 
         const statusLabels = {
             indexed: '\u2713 В індексі',
@@ -259,6 +261,9 @@
             document.getElementById('emptyMsg').style.display = 'none';
             document.getElementById('progressFill').style.width = '0%';
             counts = { total: 0, indexed: 0, not_indexed: 0, blocked: 0, error: 0 };
+            allResults = [];
+            recheckQueue = [];
+            recheckIdx = 0;
             updateStats();
             document.getElementById('stats').style.display = 'flex';
             setButtons(true);
@@ -295,27 +300,18 @@
                 const data = JSON.parse(e.data);
 
                 if (data.type === 'result') {
+                    allResults.push(data.row);
                     addRow(data.row);
                     const pct = (data.current / data.total * 100).toFixed(1);
                     document.getElementById('progressFill').style.width = pct + '%';
                     document.getElementById('progressText').textContent =
                         'Перевірка ' + data.current + '/' + data.total + ': ' + data.row.url.substring(0, 70);
 
-                    // Hide CAPTCHA panel if it was shown
-                    document.getElementById('decisionOverlay').classList.remove('active');
-                    if (googlePopup && !googlePopup.closed) { googlePopup.close(); }
-                    googlePopup = null;
-
                     counts.total++;
                     if (data.row.status === 'indexed') counts.indexed++;
                     else if (data.row.status === 'not_indexed') counts.not_indexed++;
-                    else if (data.row.status === 'blocked') counts.blocked++;
                     else counts.error++;
                     updateStats();
-                }
-                else if (data.type === 'need_manual') {
-                    // Server detected CAPTCHA — open popup for manual check
-                    showCaptchaPanel(data);
                 }
                 else if (data.type === 'error') {
                     document.getElementById('progressText').textContent = data.message;
@@ -323,16 +319,12 @@
                 else if (data.type === 'done') {
                     eventSource.close();
                     eventSource = null;
-                    document.getElementById('decisionOverlay').classList.remove('active');
-                    if (googlePopup && !googlePopup.closed) googlePopup.close();
-                    googlePopup = null;
                     setButtons(false);
                     document.getElementById('progressFill').style.width = '100%';
                     document.getElementById('progressText').textContent =
                         'Готово! Перевірено: ' + counts.total +
                         ' | \u2713 ' + counts.indexed +
                         ' | \u2717 ' + counts.not_indexed +
-                        ' | \u26D4 ' + counts.blocked +
                         ' | \u26A0 ' + counts.error;
                 }
             };
@@ -344,9 +336,39 @@
             };
         }
 
-        // ── CAPTCHA panel ──
-        function showCaptchaPanel(data) {
-            const url = data.url;
+        // ── Manual recheck of error URLs ──
+        function startRecheck() {
+            recheckQueue = [];
+            for (let i = 0; i < allResults.length; i++) {
+                if (allResults[i].status === 'error') {
+                    recheckQueue.push(i);
+                }
+            }
+            if (recheckQueue.length === 0) {
+                alert('Немає помилок для перевірки');
+                return;
+            }
+            recheckIdx = 0;
+            showRecheckUrl();
+        }
+
+        function showRecheckUrl() {
+            if (recheckIdx >= recheckQueue.length) {
+                // All rechecked — close popup & overlay
+                document.getElementById('decisionOverlay').classList.remove('active');
+                if (googlePopup && !googlePopup.closed) googlePopup.close();
+                googlePopup = null;
+                document.getElementById('progressText').textContent =
+                    'Ручну перевірку завершено! \u2713 ' + counts.indexed +
+                    ' | \u2717 ' + counts.not_indexed +
+                    ' | \u26A0 ' + counts.error;
+                setButtons(false);
+                return;
+            }
+
+            const idx = recheckQueue[recheckIdx];
+            const row = allResults[idx];
+            const url = row.url;
             const lang = document.getElementById('lang').value || 'uk';
             const clean = url.startsWith('http') ? url : 'https://' + url;
             const googleUrl = 'https://www.google.com/search?q=site:' +
@@ -354,10 +376,9 @@
 
             document.getElementById('decisionUrl').textContent = url;
             document.getElementById('decisionCounter').textContent =
-                'URL ' + data.current + ' з ' + data.total;
+                'Помилка ' + (recheckIdx + 1) + ' з ' + recheckQueue.length;
             document.getElementById('decisionOverlay').classList.add('active');
 
-            // Open Google in popup
             if (googlePopup && !googlePopup.closed) {
                 googlePopup.location.href = googleUrl;
             } else {
@@ -366,26 +387,50 @@
             }
         }
 
-        // ── Send manual result to server ──
         function sendManual(status) {
-            if (!currentTaskId) return;
+            if (!currentTaskId || recheckIdx >= recheckQueue.length) return;
 
+            const idx = recheckQueue[recheckIdx];
+            const oldStatus = allResults[idx].status;
             const commentMap = {
-                indexed: 'В індексі (підтверджено вручну після CAPTCHA)',
-                not_indexed: 'Не в індексі (підтверджено вручну після CAPTCHA)',
-                skip: 'Пропущено (CAPTCHA)'
+                indexed: 'В індексі (підтверджено вручну)',
+                not_indexed: 'Не в індексі (підтверджено вручну)',
+                skip: 'Пропущено'
             };
+            const realStatus = status === 'skip' ? 'error' : status;
+            const comment = commentMap[status] || '';
 
+            // Update local data
+            allResults[idx].status = realStatus;
+            allResults[idx].comment = comment;
+
+            // Update table row
+            const rows = document.getElementById('resultsBody').rows;
+            if (rows[idx]) {
+                const label = statusLabels[realStatus] || realStatus;
+                const badge = badgeClass[realStatus] || 'badge-error';
+                rows[idx].className = 'row-' + realStatus;
+                rows[idx].cells[2].innerHTML = '<span class=\"status-badge ' + badge + '\">' + label + '</span>';
+                rows[idx].cells[4].textContent = comment;
+            }
+
+            // Update counts
+            if (oldStatus === 'error') counts.error--;
+            if (realStatus === 'indexed') counts.indexed++;
+            else if (realStatus === 'not_indexed') counts.not_indexed++;
+            else counts.error++;
+            updateStats();
+
+            // Send to server
             fetch('/manual-result/' + currentTaskId, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    status: status === 'skip' ? 'blocked' : status,
-                    comment: commentMap[status] || '',
-                    title: ''
-                })
+                body: JSON.stringify({ index: idx, status: realStatus, comment: comment, title: '' })
             });
-            // The SSE will deliver the result row — panel will be hidden then
+
+            // Next error URL
+            recheckIdx++;
+            showRecheckUrl();
         }
 
         // ── Stop ──
@@ -417,6 +462,7 @@
             document.getElementById('btnStop').disabled = !running;
             document.getElementById('btnExportCsv').disabled = running || counts.total === 0;
             document.getElementById('btnExportXlsx').disabled = running || counts.total === 0;
+            document.getElementById('btnRecheck').disabled = running || counts.error === 0;
         }
 
         function addRow(row) {
@@ -443,7 +489,6 @@
             document.getElementById('statTotal').textContent = 'Перевірено: ' + counts.total;
             document.getElementById('statIndexed').textContent = '\u2713 В індексі: ' + counts.indexed;
             document.getElementById('statNot').textContent = '\u2717 Не в індексі: ' + counts.not_indexed;
-            document.getElementById('statBlocked').textContent = '\u26D4 Заблоковано: ' + counts.blocked;
             document.getElementById('statError').textContent = '\u26A0 Помилки: ' + counts.error;
         }
 
