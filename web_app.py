@@ -2,19 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 Веб-версія перевірки індексації Google
-Flask + Google Custom Search API + SSE (Server-Sent Events)
+Flask + скрапінг Google Search + SSE (Server-Sent Events)
+Якщо CAPTCHA — фронтенд відкриває popup для ручної перевірки.
 """
 
 import csv
 import io
 import json
 import os
+import re
 import time
 import uuid
 import threading
 from datetime import datetime
+from urllib.parse import quote
 
 import requests as http_requests
+from bs4 import BeautifulSoup
 from flask import Flask, render_template, request, jsonify, Response, send_file
 
 try:
@@ -25,10 +29,6 @@ except ImportError:
     OPENPYXL_OK = False
 
 app = Flask(__name__, template_folder="templates")
-
-# ── Config ──
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-GOOGLE_CX = os.environ.get("GOOGLE_CX", "")
 
 # ── In-memory task storage ──
 tasks = {}
@@ -47,61 +47,129 @@ class CheckTask:
         self.total = len(urls)
         self.events = []
         self.stop_event = threading.Event()
+        self.waiting_for_manual = threading.Event()
+        self.manual_result = None
 
     def push_event(self, data):
         self.events.append(data)
 
 
-# ── Google Custom Search API ──
+# ── Google scraping check (like desktop version) ──
 
-def check_indexed_api(url, lang="uk"):
-    """Check if URL is indexed using Google Custom Search API."""
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/146.0.0.0 Safari/537.36",
+    "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+def check_indexed_scrape(url, lang="uk"):
+    """
+    Check if URL is indexed by scraping Google Search.
+    Returns (status, title, comment)
+    status: "indexed" | "not_indexed" | "blocked" | "error"
+    """
     clean = url.strip()
     if not clean.startswith(("http://", "https://")):
         clean = "https://" + clean
 
     query = f"site:{clean}"
-    api_url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CX,
-        "q": query,
-        "num": 1,
-        "hl": lang,
-    }
+    search_url = f"https://www.google.com/search?q={quote(query)}&num=10&hl={quote(lang)}"
 
     try:
-        r = http_requests.get(api_url, params=params, timeout=15)
-
-        if r.status_code == 429:
-            return "blocked", "", "API ліміт вичерпано (100/день)"
-
-        if r.status_code == 403:
-            data = r.json()
-            msg = data.get("error", {}).get("message", "Forbidden")
-            if "billing" in msg.lower() or "quota" in msg.lower():
-                return "blocked", "", "API ліміт вичерпано"
-            return "error", "", f"API помилка: {msg[:120]}"
-
-        if r.status_code != 200:
-            return "error", "", f"HTTP {r.status_code}"
-
-        data = r.json()
-
-        total_results = int(data.get("searchInformation", {}).get("totalResults", "0"))
-        items = data.get("items", [])
-
-        if total_results == 0 and not items:
-            return "not_indexed", "", "Сторінка не в індексі Google"
-
-        title = items[0].get("title", "") if items else ""
-
-        return "indexed", title, f"Знайдено результати ({total_results})"
-
+        r = http_requests.get(search_url, headers=HEADERS, timeout=15)
     except http_requests.Timeout:
-        return "error", "", "Таймаут запиту до Google API"
+        return "error", "", "Таймаут запиту до Google"
     except Exception as e:
         return "error", "", f"Помилка: {str(e)[:120]}"
+
+    if r.status_code == 429:
+        return "blocked", "", "CAPTCHA — занадто багато запитів"
+
+    if r.status_code != 200:
+        return "error", "", f"HTTP {r.status_code}"
+
+    html = r.text
+    soup = BeautifulSoup(html, "html.parser")
+    plain = soup.get_text(" ", strip=True).lower()
+
+    # ── CAPTCHA / consent detection ──
+    current_url = r.url
+    if (
+        "/sorry/" in current_url
+        or "consent.google" in current_url
+        or "captcha" in plain
+        or "unusual traffic" in plain
+        or "before you continue" in plain
+    ):
+        return "blocked", "", "CAPTCHA — пройдіть вручну"
+
+    def first_h3():
+        h3 = soup.find("h3")
+        return h3.get_text(strip=True) if h3 else ""
+
+    domain = clean.split("//")[-1].split("/")[0].replace("www.", "")
+
+    # ── "No results" check ──
+    no_phrases = [
+        "did not match any documents",
+        "your search did not match",
+        "no results found",
+        "не відповідає жодному",
+        "не збігається жодному",
+        "жодних результатів",
+        "жодного документа",
+        "не знайдено жодного",
+        "немає результатів",
+    ]
+    for ph in no_phrases:
+        if ph in plain:
+            return "not_indexed", "", "Сторінка не в індексі Google"
+
+    # ── result-stats ──
+    stats_el = soup.find(id="result-stats")
+    if stats_el:
+        return "indexed", first_h3(), stats_el.get_text(strip=True)[:120]
+
+    # ── result cards ──
+    cards = soup.select("div.g, div.tF2Cxc, div[data-hveid]")
+    real = []
+    for c in cards:
+        h3 = c.find("h3")
+        a = c.find("a", href=True)
+        if h3 and a and domain in a.get("href", ""):
+            real.append(c)
+    if real:
+        h3 = real[0].find("h3")
+        return "indexed", h3.get_text(strip=True) if h3 else "", \
+               f"Знайдено {len(real)} результат(ів)"
+
+    # ── cite with domain ──
+    for cite in soup.find_all("cite"):
+        if domain in cite.get_text():
+            parent_text = ""
+            p = cite.parent
+            for _ in range(5):
+                if p is None:
+                    break
+                parent_text = p.get_text(" ", strip=True).lower()
+                if "webmasters" in parent_text or "search console" in parent_text:
+                    break
+                p = p.parent
+            else:
+                return "indexed", first_h3(), "Знайдено cite з доменом"
+
+    # ── result count in text ──
+    if re.search(r"about\s[\d,]+\sresult|[\d,]+\sresult", plain):
+        return "indexed", first_h3(), "Google показав результати"
+
+    # ── page loaded but no signal ──
+    if "google" in plain and len(plain) > 500:
+        return "not_indexed", "", "Результатів не знайдено (можливо не в індексі)"
+
+    return "error", "", "Не вдалося розпізнати відповідь Google"
 
 
 # ── Background worker ──
@@ -110,12 +178,6 @@ def run_check(task):
     task.status = "running"
     task.push_event({"type": "started", "total": task.total})
 
-    if not GOOGLE_API_KEY or not GOOGLE_CX:
-        task.status = "done"
-        task.push_event({"type": "error", "message": "GOOGLE_API_KEY або GOOGLE_CX не налаштовані"})
-        task.push_event({"type": "done"})
-        return
-
     for i, url in enumerate(task.urls):
         if task.stop_event.is_set():
             break
@@ -123,20 +185,32 @@ def run_check(task):
         task.current = i + 1
 
         try:
-            status, title, comment = check_indexed_api(url, task.lang)
+            status, title, comment = check_indexed_scrape(url, task.lang)
         except Exception as exc:
             status, title, comment = "error", "", str(exc)[:120]
 
-        # Stop on API limit
-        if status == "blocked" and "ліміт" in comment:
-            row = {
-                "num": i + 1, "url": url, "status": status,
-                "title": title, "comment": comment,
-            }
-            task.results.append(row)
-            task.push_event({"type": "result", "row": row, "current": i + 1, "total": task.total})
-            task.push_event({"type": "error", "message": "API ліміт вичерпано. Зупинено."})
-            break
+        # If blocked (CAPTCHA) — ask frontend for manual check
+        if status == "blocked":
+            task.push_event({
+                "type": "need_manual",
+                "num": i + 1,
+                "url": url,
+                "comment": comment,
+                "current": i + 1,
+                "total": task.total,
+            })
+            # Wait for manual result from frontend
+            task.waiting_for_manual.clear()
+            task.manual_result = None
+            task.waiting_for_manual.wait(timeout=300)  # 5 min max
+
+            if task.stop_event.is_set():
+                break
+
+            if task.manual_result:
+                status = task.manual_result.get("status", "blocked")
+                comment = task.manual_result.get("comment", "")
+                title = task.manual_result.get("title", "")
 
         row = {
             "num": i + 1, "url": url, "status": status,
@@ -163,7 +237,7 @@ def index():
 def start_check():
     data = request.get_json()
     urls_text = data.get("urls", "")
-    delay_ms = int(data.get("delay", 500))
+    delay_ms = int(data.get("delay", 3000))
     lang = data.get("lang", "uk")
 
     lines = [ln.strip() for ln in urls_text.splitlines() if ln.strip()]
@@ -181,6 +255,24 @@ def start_check():
     thread.start()
 
     return jsonify({"task_id": task.id, "total": len(urls)})
+
+
+@app.route("/manual-result/<task_id>", methods=["POST"])
+def manual_result(task_id):
+    """Receive manual check result from frontend when CAPTCHA was shown."""
+    with tasks_lock:
+        task = tasks.get(task_id)
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
+
+    data = request.get_json()
+    task.manual_result = {
+        "status": data.get("status", "blocked"),
+        "comment": data.get("comment", ""),
+        "title": data.get("title", ""),
+    }
+    task.waiting_for_manual.set()
+    return jsonify({"ok": True})
 
 
 @app.route("/save-results", methods=["POST"])
@@ -207,6 +299,7 @@ def stop_check(task_id):
         task = tasks.get(task_id)
     if task:
         task.stop_event.set()
+        task.waiting_for_manual.set()  # unblock if waiting
         return jsonify({"ok": True})
     return jsonify({"error": "Task not found"}), 404
 

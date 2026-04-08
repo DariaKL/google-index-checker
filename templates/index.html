@@ -63,12 +63,14 @@
         .row-not_indexed { background: #ffebee; }
         .row-blocked { background: #fff8e1; }
         .row-error { background: #fffde7; }
+        .row-skip { background: #eceff1; }
 
         .status-badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.85em; font-weight: 600; }
         .badge-indexed { background: #43a047; color: #fff; }
         .badge-not_indexed { background: #e53935; color: #fff; }
         .badge-blocked { background: #ff9800; color: #fff; }
         .badge-error { background: #fdd835; color: #333; }
+        .badge-skip { background: #90a4ae; color: #fff; }
 
         .url-cell { max-width: 350px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .url-cell a { color: #1565c0; text-decoration: none; }
@@ -76,7 +78,7 @@
 
         .empty-msg { text-align: center; color: #bbb; padding: 40px; font-size: 1.1em; }
 
-        /* ── Decision panel ── */
+        /* ── CAPTCHA decision panel ── */
         .decision-overlay {
             display: none;
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
@@ -88,15 +90,13 @@
             background: #fff; border-radius: 14px; box-shadow: 0 8px 32px rgba(0,0,0,0.25);
             padding: 28px 32px; max-width: 600px; width: 90%; text-align: center;
         }
-        .decision-panel h3 { color: #1a237e; margin-bottom: 8px; font-size: 1.2em; }
+        .decision-panel h3 { color: #e65100; margin-bottom: 8px; font-size: 1.2em; }
         .decision-url {
             font-family: 'Consolas', monospace; font-size: 0.85em; color: #1565c0;
             word-break: break-all; margin-bottom: 16px; padding: 10px;
             background: #f5f5f5; border-radius: 8px;
         }
-        .decision-hint {
-            color: #777; font-size: 0.85em; margin-bottom: 18px;
-        }
+        .decision-hint { color: #777; font-size: 0.85em; margin-bottom: 18px; }
         .decision-buttons { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
         .decision-buttons .btn { font-size: 0.95em; padding: 12px 20px; min-width: 140px; }
         .btn-indexed { background: #43a047; }
@@ -118,7 +118,7 @@
 <body>
     <div class="container">
         <h1>Перевірка індексації Google</h1>
-        <p class="subtitle">Відкриває Google пошук site:URL — ви перевіряєте результат і проходите CAPTCHA, якщо потрібно</p>
+        <p class="subtitle">Автоматична перевірка індексації через site:URL. При CAPTCHA — відкривається вікно для ручної перевірки.</p>
 
         <!-- URL Input -->
         <div class="card">
@@ -134,6 +134,10 @@
         <div class="card">
             <h2>2) Налаштування</h2>
             <div class="settings">
+                <div>
+                    <label for="delay">Пауза між запитами (мс):</label>
+                    <input type="number" id="delay" value="3000" min="500" max="60000" step="500">
+                </div>
                 <div>
                     <label for="lang">Мова (hl):</label>
                     <input type="text" id="lang" value="uk" style="width:60px">
@@ -158,10 +162,10 @@
         <!-- Stats -->
         <div class="stats" id="stats" style="display:none">
             <span class="stat stat-total" id="statTotal">Перевірено: 0</span>
-            <span class="stat stat-indexed" id="statIndexed">✓ В індексі: 0</span>
-            <span class="stat stat-not" id="statNot">✗ Не в індексі: 0</span>
-            <span class="stat stat-blocked" id="statBlocked">⛔ Заблоковано: 0</span>
-            <span class="stat stat-error" id="statError">⚠ Помилки: 0</span>
+            <span class="stat stat-indexed" id="statIndexed">&#10003; В індексі: 0</span>
+            <span class="stat stat-not" id="statNot">&#10007; Не в індексі: 0</span>
+            <span class="stat stat-blocked" id="statBlocked">&#9940; Заблоковано: 0</span>
+            <span class="stat stat-error" id="statError">&#9888; Помилки: 0</span>
         </div>
 
         <!-- Results -->
@@ -171,9 +175,10 @@
                 <table>
                     <thead>
                         <tr>
-                            <th>№</th>
+                            <th>&#8470;</th>
                             <th>URL</th>
                             <th>Статус</th>
+                            <th>Заголовок</th>
                             <th>Коментар</th>
                         </tr>
                     </thead>
@@ -185,20 +190,19 @@
         </div>
     </div>
 
-    <!-- Decision overlay -->
+    <!-- CAPTCHA decision overlay (shown only when server detects CAPTCHA) -->
     <div class="decision-overlay" id="decisionOverlay">
         <div class="decision-panel">
-            <h3>🔍 Перевірте результат у вікні Google</h3>
+            <h3>&#9940; CAPTCHA виявлено!</h3>
             <div class="decision-url" id="decisionUrl"></div>
             <div class="decision-hint">
-                Подивіться на відкрите вікно Google. Якщо бачите CAPTCHA — пройдіть її, потім натисніть «🔄 Повторити».<br>
-                Якщо бачите результати — натисніть відповідну кнопку.
+                Google показав CAPTCHA. Пройдіть її у відкритому вікні, потім оберіть результат:<br>
+                Якщо бачите результати пошуку — натисніть відповідну кнопку.
             </div>
             <div class="decision-buttons">
-                <button class="btn btn-indexed" onclick="decide('indexed')">✓ В індексі</button>
-                <button class="btn btn-not-indexed" onclick="decide('not_indexed')">✗ Не в індексі</button>
-                <button class="btn btn-captcha" onclick="decide('retry')">🔄 Повторити</button>
-                <button class="btn btn-skip" onclick="decide('skip')">⏭ Пропустити</button>
+                <button class="btn btn-indexed" onclick="sendManual('indexed')">&#10003; В індексі</button>
+                <button class="btn btn-not-indexed" onclick="sendManual('not_indexed')">&#10007; Не в індексі</button>
+                <button class="btn btn-skip" onclick="sendManual('skip')">&#9193; Пропустити</button>
             </div>
             <div class="decision-counter" id="decisionCounter"></div>
         </div>
@@ -207,26 +211,23 @@
     <script>
         // ── Globals ──
         let currentTaskId = null;
-        let allResults = [];
-        let urlList = [];
-        let currentIndex = 0;
+        let eventSource = null;
         let googlePopup = null;
-        let stopped = false;
         let counts = { total: 0, indexed: 0, not_indexed: 0, blocked: 0, error: 0 };
 
         const statusLabels = {
-            indexed: '✓ В індексі',
-            not_indexed: '✗ Не в індексі',
-            blocked: '⛔ Заблоковано',
-            error: '⚠ Помилка',
-            skip: '⏭ Пропущено'
+            indexed: '\u2713 В індексі',
+            not_indexed: '\u2717 Не в індексі',
+            blocked: '\u26D4 Заблоковано',
+            error: '\u26A0 Помилка',
+            skip: '\u23ED Пропущено'
         };
         const badgeClass = {
             indexed: 'badge-indexed',
             not_indexed: 'badge-not_indexed',
             blocked: 'badge-blocked',
             error: 'badge-error',
-            skip: 'badge-error'
+            skip: 'badge-skip'
         };
 
         // ── File upload ──
@@ -245,25 +246,15 @@
             }
         });
 
-        // ── Parse URLs ──
-        function parseUrls(text) {
-            return text.split('\n')
-                .map(l => l.trim())
-                .filter(l => l && (l.startsWith('http://') || l.startsWith('https://') || l.includes('.')));
-        }
-
         // ── Start ──
         function startCheck() {
-            const text = document.getElementById('urlInput').value.trim();
-            if (!text) { alert('Будь ласка, введіть хоча б один URL'); return; }
+            const urls = document.getElementById('urlInput').value.trim();
+            if (!urls) { alert('Будь ласка, введіть хоча б один URL'); return; }
 
-            urlList = parseUrls(text);
-            if (!urlList.length) { alert('Не знайдено жодного валідного URL'); return; }
+            const delay = document.getElementById('delay').value;
+            const lang = document.getElementById('lang').value;
 
             // Reset
-            allResults = [];
-            currentIndex = 0;
-            stopped = false;
             document.getElementById('resultsBody').innerHTML = '';
             document.getElementById('emptyMsg').style.display = 'none';
             document.getElementById('progressFill').style.width = '0%';
@@ -272,125 +263,144 @@
             document.getElementById('stats').style.display = 'flex';
             setButtons(true);
 
-            document.getElementById('progressText').textContent =
-                `Перевірка: 0/${urlList.length}. Дозвольте popup-вікна якщо браузер запитає!`;
-
-            processNext();
+            fetch('/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ urls, delay, lang })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    alert(data.error);
+                    setButtons(false);
+                    return;
+                }
+                currentTaskId = data.task_id;
+                document.getElementById('progressText').textContent =
+                    'Перевірка запущена... (' + data.total + ' URL)';
+                listenEvents(data.task_id);
+            })
+            .catch(err => {
+                alert('Помилка: ' + err);
+                setButtons(false);
+            });
         }
 
-        // ── Process next URL ──
-        function processNext() {
-            if (stopped || currentIndex >= urlList.length) {
-                finish();
-                return;
-            }
+        // ── SSE listener ──
+        function listenEvents(taskId) {
+            if (eventSource) eventSource.close();
+            eventSource = new EventSource('/events/' + taskId);
 
-            const url = urlList[currentIndex];
+            eventSource.onmessage = function(e) {
+                const data = JSON.parse(e.data);
+
+                if (data.type === 'result') {
+                    addRow(data.row);
+                    const pct = (data.current / data.total * 100).toFixed(1);
+                    document.getElementById('progressFill').style.width = pct + '%';
+                    document.getElementById('progressText').textContent =
+                        'Перевірка ' + data.current + '/' + data.total + ': ' + data.row.url.substring(0, 70);
+
+                    // Hide CAPTCHA panel if it was shown
+                    document.getElementById('decisionOverlay').classList.remove('active');
+                    if (googlePopup && !googlePopup.closed) { googlePopup.close(); }
+                    googlePopup = null;
+
+                    counts.total++;
+                    if (data.row.status === 'indexed') counts.indexed++;
+                    else if (data.row.status === 'not_indexed') counts.not_indexed++;
+                    else if (data.row.status === 'blocked') counts.blocked++;
+                    else counts.error++;
+                    updateStats();
+                }
+                else if (data.type === 'need_manual') {
+                    // Server detected CAPTCHA — open popup for manual check
+                    showCaptchaPanel(data);
+                }
+                else if (data.type === 'error') {
+                    document.getElementById('progressText').textContent = data.message;
+                }
+                else if (data.type === 'done') {
+                    eventSource.close();
+                    eventSource = null;
+                    document.getElementById('decisionOverlay').classList.remove('active');
+                    if (googlePopup && !googlePopup.closed) googlePopup.close();
+                    googlePopup = null;
+                    setButtons(false);
+                    document.getElementById('progressFill').style.width = '100%';
+                    document.getElementById('progressText').textContent =
+                        'Готово! Перевірено: ' + counts.total +
+                        ' | \u2713 ' + counts.indexed +
+                        ' | \u2717 ' + counts.not_indexed +
+                        ' | \u26D4 ' + counts.blocked +
+                        ' | \u26A0 ' + counts.error;
+                }
+            };
+
+            eventSource.onerror = function() {
+                eventSource.close();
+                eventSource = null;
+                setButtons(false);
+            };
+        }
+
+        // ── CAPTCHA panel ──
+        function showCaptchaPanel(data) {
+            const url = data.url;
             const lang = document.getElementById('lang').value || 'uk';
             const clean = url.startsWith('http') ? url : 'https://' + url;
-            const googleUrl = 'https://www.google.com/search?q=site:' + encodeURIComponent(clean) + '&hl=' + encodeURIComponent(lang);
+            const googleUrl = 'https://www.google.com/search?q=site:' +
+                encodeURIComponent(clean) + '&hl=' + encodeURIComponent(lang);
 
-            // Update progress
-            document.getElementById('progressText').textContent =
-                `Перевірка ${currentIndex + 1}/${urlList.length}: ${url.substring(0, 70)}`;
-            const pct = (currentIndex / urlList.length * 100).toFixed(1);
-            document.getElementById('progressFill').style.width = pct + '%';
-
-            // Show decision panel
             document.getElementById('decisionUrl').textContent = url;
             document.getElementById('decisionCounter').textContent =
-                `URL ${currentIndex + 1} з ${urlList.length}`;
+                'URL ' + data.current + ' з ' + data.total;
             document.getElementById('decisionOverlay').classList.add('active');
 
-            // Open Google popup
+            // Open Google in popup
             if (googlePopup && !googlePopup.closed) {
                 googlePopup.location.href = googleUrl;
             } else {
                 googlePopup = window.open(googleUrl, 'googleCheck',
                     'width=1000,height=700,scrollbars=yes,resizable=yes');
             }
-
-            if (!googlePopup || googlePopup.closed) {
-                alert('Браузер заблокував popup-вікно! Дозвольте popup-вікна для цього сайту і натисніть Старт знову.');
-                finish();
-            }
         }
 
-        // ── User decision ──
-        function decide(status) {
-            if (status === 'retry') {
-                // Re-open same URL
-                const url = urlList[currentIndex];
-                const lang = document.getElementById('lang').value || 'uk';
-                const clean = url.startsWith('http') ? url : 'https://' + url;
-                const googleUrl = 'https://www.google.com/search?q=site:' + encodeURIComponent(clean) + '&hl=' + encodeURIComponent(lang);
-                if (googlePopup && !googlePopup.closed) {
-                    googlePopup.location.href = googleUrl;
-                } else {
-                    googlePopup = window.open(googleUrl, 'googleCheck',
-                        'width=1000,height=700,scrollbars=yes,resizable=yes');
-                }
-                return;
-            }
+        // ── Send manual result to server ──
+        function sendManual(status) {
+            if (!currentTaskId) return;
 
-            const url = urlList[currentIndex];
             const commentMap = {
-                indexed: 'В індексі Google (підтверджено вручну)',
-                not_indexed: 'Не знайдено в індексі Google',
-                skip: 'Пропущено користувачем'
+                indexed: 'В індексі (підтверджено вручну після CAPTCHA)',
+                not_indexed: 'Не в індексі (підтверджено вручну після CAPTCHA)',
+                skip: 'Пропущено (CAPTCHA)'
             };
 
-            const row = {
-                num: currentIndex + 1,
-                url: url,
-                status: status,
-                title: '',
-                comment: commentMap[status] || ''
-            };
-
-            allResults.push(row);
-            addRow(row);
-
-            counts.total++;
-            if (status === 'indexed') counts.indexed++;
-            else if (status === 'not_indexed') counts.not_indexed++;
-            else if (status === 'blocked') counts.blocked++;
-            else counts.error++;
-            updateStats();
-
-            currentIndex++;
-            processNext();
-        }
-
-        // ── Finish ──
-        function finish() {
-            document.getElementById('decisionOverlay').classList.remove('active');
-            if (googlePopup && !googlePopup.closed) googlePopup.close();
-            googlePopup = null;
-
-            setButtons(false);
-            document.getElementById('progressFill').style.width = '100%';
-            document.getElementById('progressText').textContent =
-                `Готово! Перевірено: ${counts.total} | ✓ ${counts.indexed} | ✗ ${counts.not_indexed} | ⛔ ${counts.blocked} | ⚠ ${counts.error}`;
-
-            // Save results to server for export
-            if (allResults.length > 0) {
-                fetch('/save-results', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ results: allResults })
+            fetch('/manual-result/' + currentTaskId, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    status: status === 'skip' ? 'blocked' : status,
+                    comment: commentMap[status] || '',
+                    title: ''
                 })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.task_id) currentTaskId = data.task_id;
-                });
-            }
+            });
+            // The SSE will deliver the result row — panel will be hidden then
         }
 
         // ── Stop ──
         function stopCheck() {
-            stopped = true;
-            finish();
+            if (currentTaskId) {
+                fetch('/stop/' + currentTaskId, { method: 'POST' });
+            }
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            document.getElementById('decisionOverlay').classList.remove('active');
+            if (googlePopup && !googlePopup.closed) googlePopup.close();
+            googlePopup = null;
+            setButtons(false);
             document.getElementById('progressText').textContent = 'Зупинено користувачем.';
         }
 
@@ -417,12 +427,12 @@
             const label = statusLabels[row.status] || row.status;
             const badge = badgeClass[row.status] || 'badge-error';
 
-            tr.innerHTML = `
-                <td>${row.num}</td>
-                <td class="url-cell"><a href="${escHtml(row.url)}" target="_blank" rel="noopener">${escHtml(row.url)}</a></td>
-                <td><span class="status-badge ${badge}">${label}</span></td>
-                <td>${escHtml(row.comment)}</td>
-            `;
+            tr.innerHTML =
+                '<td>' + row.num + '</td>' +
+                '<td class="url-cell"><a href="' + escHtml(row.url) + '" target="_blank" rel="noopener">' + escHtml(row.url) + '</a></td>' +
+                '<td><span class="status-badge ' + badge + '">' + label + '</span></td>' +
+                '<td>' + escHtml(row.title || '') + '</td>' +
+                '<td>' + escHtml(row.comment || '') + '</td>';
             tbody.appendChild(tr);
 
             const wrap = document.getElementById('tableWrap');
@@ -431,10 +441,10 @@
 
         function updateStats() {
             document.getElementById('statTotal').textContent = 'Перевірено: ' + counts.total;
-            document.getElementById('statIndexed').textContent = '✓ В індексі: ' + counts.indexed;
-            document.getElementById('statNot').textContent = '✗ Не в індексі: ' + counts.not_indexed;
-            document.getElementById('statBlocked').textContent = '⛔ Заблоковано: ' + counts.blocked;
-            document.getElementById('statError').textContent = '⚠ Помилки: ' + counts.error;
+            document.getElementById('statIndexed').textContent = '\u2713 В індексі: ' + counts.indexed;
+            document.getElementById('statNot').textContent = '\u2717 Не в індексі: ' + counts.not_indexed;
+            document.getElementById('statBlocked').textContent = '\u26D4 Заблоковано: ' + counts.blocked;
+            document.getElementById('statError').textContent = '\u26A0 Помилки: ' + counts.error;
         }
 
         function escHtml(str) {
