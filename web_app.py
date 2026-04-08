@@ -9,7 +9,7 @@ import csv
 import io
 import json
 import os
-import re
+import queue as _queue_mod
 import time
 import uuid
 import threading
@@ -17,6 +17,7 @@ from datetime import datetime
 from urllib.parse import quote
 
 from flask import Flask, render_template, request, jsonify, Response, send_file
+from playwright.sync_api import sync_playwright
 
 try:
     import openpyxl
@@ -51,18 +52,14 @@ class CheckTask:
         self.events.append(data)
 
 
-# ── Playwright browser management ──
+# ── Playwright — dedicated worker thread ──
 
-import queue as _queue_mod
-from playwright.sync_api import sync_playwright
-
-# ── Playwright runs in its own dedicated thread ──
 _pw_queue = _queue_mod.Queue()
 _pw_ready = threading.Event()
 
 
 def _pw_worker():
-    """Dedicated thread: owns Playwright + browser, processes jobs from queue."""
+    """Single thread owns Playwright + Chromium; all checks go through queue."""
     pw = sync_playwright().start()
     launch_args = [
         "--no-sandbox",
@@ -71,7 +68,6 @@ def _pw_worker():
         "--disable-blink-features=AutomationControlled",
         "--disable-extensions",
         "--disable-infobars",
-        "--single-process",
     ]
 
     def launch():
@@ -88,14 +84,23 @@ def _pw_worker():
         try:
             if not browser.is_connected():
                 browser = launch()
-            result_holder["result"] = _do_check(browser, url, lang)
+            result = _do_check(browser, url, lang)
+            result_holder["result"] = result
+            # After CAPTCHA the browser may be corrupted → force relaunch
+            if result[0] == "captcha":
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                browser = launch()
         except Exception as e:
-            err_msg = str(e)[:120]
-            result_holder["result"] = ("error", "", f"Помилка: {err_msg}")
-            # If browser crashed, relaunch for next job
+            result_holder["result"] = ("error", "", f"Помилка: {str(e)[:120]}")
             try:
-                if not browser.is_connected():
-                    browser = launch()
+                browser.close()
+            except Exception:
+                pass
+            try:
+                browser = launch()
             except Exception:
                 pass
         done_event.set()
@@ -105,7 +110,7 @@ def _pw_worker():
 
 
 def _do_check(browser, url, lang):
-    """Run one index-check inside the Playwright thread."""
+    """Run one Google site: search in headless Chromium."""
     clean = url.strip()
     if not clean.startswith(("http://", "https://")):
         clean = "https://" + clean
@@ -115,9 +120,11 @@ def _do_check(browser, url, lang):
     )
 
     context = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/124.0.0.0 Safari/537.36",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
         locale=f"{lang}-UA",
         viewport={"width": 1280, "height": 720},
     )
@@ -132,19 +139,20 @@ def _do_check(browser, url, lang):
 
         page = context.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(2000)
         page.wait_for_timeout(2000)  # let JS render
 
         current_url = page.url
 
+        # ── CAPTCHA → special "captcha" status ──
         if "/sorry/" in current_url:
-            return "error", "", "Google заблокував (CAPTCHA) — потрібна ручна перевірка"
+            return "captcha", "", "CAPTCHA — потрібна ручна перевірка"
 
         text = page.inner_text("body").lower()
 
         if "unusual traffic" in text or "our systems have detected unusual" in text:
-            return "error", "", "Google виявив незвичний трафік — потрібна ручна перевірка"
+            return "captcha", "", "Незвичний трафік — потрібна ручна перевірка"
 
+        # ── "No results" = not indexed ──
         no_phrases = [
             "did not match any documents",
             "your search did not match",
@@ -160,12 +168,14 @@ def _do_check(browser, url, lang):
             if ph in text:
                 return "not_indexed", "", "Сторінка не в індексі Google"
 
+        # ── result-stats → indexed ──
         stats = page.query_selector("#result-stats")
         if stats:
             h3 = page.query_selector("h3")
             title = h3.inner_text()[:120] if h3 else ""
             return "indexed", title, stats.inner_text()[:120]
 
+        # ── h3 results → indexed ──
         h3s = page.query_selector_all("h3")
         if h3s:
             title = h3s[0].inner_text()[:120] if h3s else ""
@@ -183,7 +193,7 @@ def _do_check(browser, url, lang):
 
 
 def check_indexed_playwright(url, lang="uk"):
-    """Submit a check job to the dedicated Playwright thread and wait for result."""
+    """Submit a check to the Playwright thread and wait for result."""
     _pw_ready.wait()
     holder = {}
     done = threading.Event()
@@ -192,7 +202,7 @@ def check_indexed_playwright(url, lang="uk"):
     return holder.get("result", ("error", "", "Таймаут перевірки"))
 
 
-# Start the Playwright worker thread at import time
+# Start the Playwright worker at import time
 _pw_thread = threading.Thread(target=_pw_worker, daemon=True)
 _pw_thread.start()
 
@@ -214,12 +224,41 @@ def run_check(task):
         except Exception as exc:
             status, title, comment = "error", "", str(exc)[:120]
 
+        # ── CAPTCHA detected → pause and wait for user decision ──
+        if status == "captcha":
+            task.manual_result = None
+            task.waiting_for_manual.clear()
+            task.push_event({
+                "type": "need_manual",
+                "url": url,
+                "num": i + 1,
+                "total": task.total,
+                "comment": comment,
+            })
+            # Block until user responds or 5 min timeout
+            task.waiting_for_manual.wait(timeout=300)
+
+            if task.stop_event.is_set():
+                break
+
+            if task.manual_result:
+                status = task.manual_result.get("status", "error")
+                title = task.manual_result.get("title", "")
+                comment = task.manual_result.get("comment", "Перевірено вручну")
+                task.manual_result = None
+            else:
+                status = "error"
+                comment = "Таймаут ручної перевірки"
+
         row = {
             "num": i + 1, "url": url, "status": status,
             "title": title, "comment": comment,
         }
         task.results.append(row)
-        task.push_event({"type": "result", "row": row, "current": i + 1, "total": task.total})
+        task.push_event({
+            "type": "result", "row": row,
+            "current": i + 1, "total": task.total,
+        })
 
         if i < task.total - 1 and not task.stop_event.is_set():
             time.sleep(task.delay_ms / 1000)
@@ -261,18 +300,27 @@ def start_check():
 
 @app.route("/manual-result/<task_id>", methods=["POST"])
 def manual_result(task_id):
-    """Receive manual check result from frontend (recheck of error URLs)."""
+    """Receive manual check result from the frontend."""
     with tasks_lock:
         task = tasks.get(task_id)
     if not task:
         return jsonify({"error": "Task not found"}), 404
 
     data = request.get_json()
-    idx = data.get("index")
     status = data.get("status", "error")
     comment = data.get("comment", "")
     title = data.get("title", "")
+    idx = data.get("index")
 
+    # During active check → unblock the waiting worker thread
+    if task.status == "running" and idx is None:
+        task.manual_result = {
+            "status": status, "title": title, "comment": comment,
+        }
+        task.waiting_for_manual.set()
+        return jsonify({"ok": True})
+
+    # Post-check recheck of a specific result row
     if idx is not None and 0 <= idx < len(task.results):
         task.results[idx]["status"] = status
         task.results[idx]["comment"] = comment
@@ -352,9 +400,11 @@ def export(task_id, fmt):
         writer = csv.writer(buf)
         writer.writerow(["№", "URL", "Статус", "Заголовок", "Коментар"])
         for r in task.results:
-            writer.writerow([r.get("num", ""), r.get("url", ""),
-                             label_map.get(r.get("status", ""), r.get("status", "")),
-                             r.get("title", ""), r.get("comment", "")])
+            writer.writerow([
+                r.get("num", ""), r.get("url", ""),
+                label_map.get(r.get("status", ""), r.get("status", "")),
+                r.get("title", ""), r.get("comment", ""),
+            ])
         output = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
         output.seek(0)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -369,21 +419,24 @@ def export(task_id, fmt):
         ws.append(headers)
         for cell in ws[1]:
             cell.font = Font(bold=True, color="FFFFFF", size=11)
-            cell.fill = PatternFill(start_color="1A237E", end_color="1A237E", fill_type="solid")
+            cell.fill = PatternFill(start_color="1A237E", end_color="1A237E",
+                                    fill_type="solid")
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
         fill_map = {
             "indexed": "C8E6C9", "not_indexed": "FFCDD2",
-            "blocked": "FFE0B2", "error": "FFF9C4",
-            "skip": "E0E0E0",
+            "blocked": "FFE0B2", "error": "FFF9C4", "skip": "E0E0E0",
         }
         for r in task.results:
-            ws.append([r.get("num", ""), r.get("url", ""),
-                       label_map.get(r.get("status", ""), r.get("status", "")),
-                       r.get("title", ""), r.get("comment", "")])
+            ws.append([
+                r.get("num", ""), r.get("url", ""),
+                label_map.get(r.get("status", ""), r.get("status", "")),
+                r.get("title", ""), r.get("comment", ""),
+            ])
             color = fill_map.get(r.get("status", ""), "F5F5F5")
             for cell in ws[ws.max_row]:
-                cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+                cell.fill = PatternFill(start_color=color, end_color=color,
+                                        fill_type="solid")
 
         col_widths = [6, 70, 15, 50, 50]
         for i, w in enumerate(col_widths, 1):
@@ -394,8 +447,12 @@ def export(task_id, fmt):
         wb.save(buf)
         buf.seek(0)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return send_file(buf, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                         as_attachment=True, download_name=f"index_check_{ts}.xlsx")
+        return send_file(
+            buf,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=f"index_check_{ts}.xlsx",
+        )
 
     return jsonify({"error": "Unsupported format"}), 400
 

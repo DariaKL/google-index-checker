@@ -28,7 +28,7 @@
         .settings input, .settings select { padding: 6px 10px; border: 2px solid #e0e0e0; border-radius: 6px; font-size: 0.9em; }
         .settings input:focus, .settings select:focus { outline: none; border-color: #1e88e5; }
 
-        .btn-row { display: flex; gap: 10px; margin-bottom: 16px; }
+        .btn-row { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
         .btn { padding: 12px 28px; border: none; border-radius: 8px; font-size: 1em; font-weight: 600; cursor: pointer; transition: all 0.2s; color: #fff; }
         .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
@@ -46,7 +46,6 @@
         .stat-total { background: #e8eaf6; color: #1a237e; }
         .stat-indexed { background: #c8e6c9; color: #1b5e20; }
         .stat-not { background: #ffcdd2; color: #b71c1c; }
-        .stat-blocked { background: #fff3e0; color: #e65100; }
         .stat-error { background: #fff9c4; color: #f57f17; }
 
         table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
@@ -61,14 +60,12 @@
 
         .row-indexed { background: #e8f5e9; }
         .row-not_indexed { background: #ffebee; }
-        .row-blocked { background: #fff8e1; }
         .row-error { background: #fffde7; }
         .row-skip { background: #eceff1; }
 
         .status-badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.85em; font-weight: 600; }
         .badge-indexed { background: #43a047; color: #fff; }
         .badge-not_indexed { background: #e53935; color: #fff; }
-        .badge-blocked { background: #ff9800; color: #fff; }
         .badge-error { background: #fdd835; color: #333; }
         .badge-skip { background: #90a4ae; color: #fff; }
 
@@ -78,7 +75,7 @@
 
         .empty-msg { text-align: center; color: #bbb; padding: 40px; font-size: 1.1em; }
 
-        /* ── CAPTCHA decision panel ── */
+        /* ── CAPTCHA / manual decision overlay ── */
         .decision-overlay {
             display: none;
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
@@ -101,7 +98,6 @@
         .decision-buttons .btn { font-size: 0.95em; padding: 12px 20px; min-width: 140px; }
         .btn-indexed { background: #43a047; }
         .btn-not-indexed { background: #e53935; }
-        .btn-captcha { background: #ff9800; }
         .btn-skip { background: #78909c; }
         .decision-counter { color: #999; font-size: 0.8em; margin-top: 14px; }
 
@@ -118,7 +114,7 @@
 <body>
     <div class="container">
         <h1>Перевірка індексації Google</h1>
-        <p class="subtitle">Автоматична перевірка індексації через site:URL. При CAPTCHA — відкривається вікно для ручної перевірки.</p>
+        <p class="subtitle">Автоматична перевірка індексації через site:URL. При CAPTCHA — автоматично відкривається вікно.</p>
 
         <!-- URL Input -->
         <div class="card">
@@ -190,10 +186,10 @@
         </div>
     </div>
 
-    <!-- Manual recheck overlay (shown only when user clicks "Перевірити помилки вручну") -->
+    <!-- Decision overlay (auto-opens on CAPTCHA, also used for post-check recheck) -->
     <div class="decision-overlay" id="decisionOverlay">
         <div class="decision-panel">
-            <h3>&#128269; Ручна перевірка</h3>
+            <h3 id="decisionTitle">&#128269; Ручна перевірка</h3>
             <div class="decision-url" id="decisionUrl"></div>
             <div class="decision-hint">
                 Перегляньте результат Google у відкритому вікні і оберіть статус:
@@ -208,31 +204,30 @@
     </div>
 
     <script>
-        // ── Globals ──
+        /* ── Globals ── */
         let currentTaskId = null;
         let eventSource = null;
         let googlePopup = null;
-        let counts = { total: 0, indexed: 0, not_indexed: 0, blocked: 0, error: 0 };
-        let allResults = [];        // all result rows from SSE
-        let recheckQueue = [];      // indices of error rows to recheck
-        let recheckIdx = 0;         // current position in recheckQueue
+        let counts = { total: 0, indexed: 0, not_indexed: 0, error: 0 };
+        let allResults = [];
+        let recheckQueue = [];
+        let recheckIdx = 0;
+        let manualDuringCheck = false;   // true while CAPTCHA overlay is shown during active check
 
         const statusLabels = {
-            indexed: '\u2713 В індексі',
+            indexed:     '\u2713 В індексі',
             not_indexed: '\u2717 Не в індексі',
-            blocked: '\u26D4 Заблоковано',
-            error: '\u26A0 Помилка',
-            skip: '\u23ED Пропущено'
+            error:       '\u26A0 Помилка',
+            skip:        '\u23ED Пропущено'
         };
         const badgeClass = {
-            indexed: 'badge-indexed',
+            indexed:     'badge-indexed',
             not_indexed: 'badge-not_indexed',
-            blocked: 'badge-blocked',
-            error: 'badge-error',
-            skip: 'badge-skip'
+            error:       'badge-error',
+            skip:        'badge-skip'
         };
 
-        // ── File upload ──
+        /* ── File upload ── */
         document.getElementById('fileInput').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (!file) return;
@@ -248,22 +243,22 @@
             }
         });
 
-        // ── Start ──
+        /* ── Start check ── */
         function startCheck() {
             const urls = document.getElementById('urlInput').value.trim();
             if (!urls) { alert('Будь ласка, введіть хоча б один URL'); return; }
-
             const delay = document.getElementById('delay').value;
-            const lang = document.getElementById('lang').value;
+            const lang  = document.getElementById('lang').value;
 
-            // Reset
+            // Reset state
             document.getElementById('resultsBody').innerHTML = '';
             document.getElementById('emptyMsg').style.display = 'none';
             document.getElementById('progressFill').style.width = '0%';
-            counts = { total: 0, indexed: 0, not_indexed: 0, blocked: 0, error: 0 };
+            counts = { total: 0, indexed: 0, not_indexed: 0, error: 0 };
             allResults = [];
             recheckQueue = [];
             recheckIdx = 0;
+            manualDuringCheck = false;
             updateStats();
             document.getElementById('stats').style.display = 'flex';
             setButtons(true);
@@ -275,23 +270,16 @@
             })
             .then(r => r.json())
             .then(data => {
-                if (data.error) {
-                    alert(data.error);
-                    setButtons(false);
-                    return;
-                }
+                if (data.error) { alert(data.error); setButtons(false); return; }
                 currentTaskId = data.task_id;
                 document.getElementById('progressText').textContent =
                     'Перевірка запущена... (' + data.total + ' URL)';
                 listenEvents(data.task_id);
             })
-            .catch(err => {
-                alert('Помилка: ' + err);
-                setButtons(false);
-            });
+            .catch(err => { alert('Помилка: ' + err); setButtons(false); });
         }
 
-        // ── SSE listener ──
+        /* ── SSE listener ── */
         function listenEvents(taskId) {
             if (eventSource) eventSource.close();
             eventSource = new EventSource('/events/' + taskId);
@@ -300,12 +288,14 @@
                 const data = JSON.parse(e.data);
 
                 if (data.type === 'result') {
+                    /* Normal result — indexed / not_indexed / error */
                     allResults.push(data.row);
                     addRow(data.row);
                     const pct = (data.current / data.total * 100).toFixed(1);
                     document.getElementById('progressFill').style.width = pct + '%';
                     document.getElementById('progressText').textContent =
-                        'Перевірка ' + data.current + '/' + data.total + ': ' + data.row.url.substring(0, 70);
+                        'Перевірка ' + data.current + '/' + data.total + ': ' +
+                        data.row.url.substring(0, 70);
 
                     counts.total++;
                     if (data.row.status === 'indexed') counts.indexed++;
@@ -313,9 +303,34 @@
                     else counts.error++;
                     updateStats();
                 }
-                else if (data.type === 'error') {
-                    document.getElementById('progressText').textContent = data.message;
+
+                else if (data.type === 'need_manual') {
+                    /* ── CAPTCHA detected — auto-open Google popup ── */
+                    manualDuringCheck = true;
+                    const url  = data.url;
+                    const lang = document.getElementById('lang').value || 'uk';
+                    const clean = url.startsWith('http') ? url : 'https://' + url;
+                    const googleUrl = 'https://www.google.com/search?q=site:' +
+                        encodeURIComponent(clean) + '&hl=' + encodeURIComponent(lang);
+
+                    document.getElementById('decisionTitle').innerHTML = '&#9888; CAPTCHA — ручна перевірка';
+                    document.getElementById('decisionUrl').textContent = url;
+                    document.getElementById('decisionCounter').textContent =
+                        'URL ' + data.num + ' з ' + data.total + ' — ' +
+                        (data.comment || 'потрібна ручна перевірка');
+                    document.getElementById('decisionOverlay').classList.add('active');
+
+                    document.getElementById('progressText').textContent =
+                        'CAPTCHA! Перевірте URL #' + data.num + ' вручну у відкритому вікні...';
+
+                    if (googlePopup && !googlePopup.closed) {
+                        googlePopup.location.href = googleUrl;
+                    } else {
+                        googlePopup = window.open(googleUrl, 'googleCheck',
+                            'width=1000,height=700,scrollbars=yes,resizable=yes');
+                    }
                 }
+
                 else if (data.type === 'done') {
                     eventSource.close();
                     eventSource = null;
@@ -336,13 +351,69 @@
             };
         }
 
-        // ── Manual recheck of error URLs ──
+        /* ── Send manual decision (works both during check and post-check) ── */
+        function sendManual(status) {
+            const commentMap = {
+                indexed:     'В індексі (підтверджено вручну)',
+                not_indexed: 'Не в індексі (підтверджено вручну)',
+                skip:        'Пропущено'
+            };
+            const realStatus = (status === 'skip') ? 'error' : status;
+            const comment = commentMap[status] || '';
+
+            if (manualDuringCheck) {
+                /* During active check — send decision to unblock server thread */
+                fetch('/manual-result/' + currentTaskId, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ status: realStatus, comment: comment, title: '' })
+                });
+                document.getElementById('decisionOverlay').classList.remove('active');
+                manualDuringCheck = false;
+                document.getElementById('progressText').textContent = 'Продовжую перевірку...';
+                return;
+            }
+
+            /* Post-check recheck */
+            if (!currentTaskId || recheckIdx >= recheckQueue.length) return;
+
+            const idx = recheckQueue[recheckIdx];
+            const oldStatus = allResults[idx].status;
+
+            allResults[idx].status  = realStatus;
+            allResults[idx].comment = comment;
+
+            const rows = document.getElementById('resultsBody').rows;
+            if (rows[idx]) {
+                const label = statusLabels[realStatus] || realStatus;
+                const badge = badgeClass[realStatus]   || 'badge-error';
+                rows[idx].className = 'row-' + realStatus;
+                rows[idx].cells[2].innerHTML =
+                    '<span class="status-badge ' + badge + '">' + label + '</span>';
+                rows[idx].cells[4].textContent = comment;
+            }
+
+            if (oldStatus === 'error') counts.error--;
+            if (realStatus === 'indexed') counts.indexed++;
+            else if (realStatus === 'not_indexed') counts.not_indexed++;
+            else counts.error++;
+            updateStats();
+
+            fetch('/manual-result/' + currentTaskId, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ index: idx, status: realStatus, comment: comment, title: '' })
+            });
+
+            recheckIdx++;
+            showRecheckUrl();
+        }
+
+        /* ── Post-check recheck of error URLs ── */
         function startRecheck() {
             recheckQueue = [];
             for (let i = 0; i < allResults.length; i++) {
-                if (allResults[i].status === 'error') {
-                    recheckQueue.push(i);
-                }
+                if (allResults[i].status === 'error') recheckQueue.push(i);
             }
             if (recheckQueue.length === 0) {
                 alert('Немає помилок для перевірки');
@@ -354,7 +425,6 @@
 
         function showRecheckUrl() {
             if (recheckIdx >= recheckQueue.length) {
-                // All rechecked — close popup & overlay
                 document.getElementById('decisionOverlay').classList.remove('active');
                 if (googlePopup && !googlePopup.closed) googlePopup.close();
                 googlePopup = null;
@@ -367,13 +437,13 @@
             }
 
             const idx = recheckQueue[recheckIdx];
-            const row = allResults[idx];
-            const url = row.url;
+            const url = allResults[idx].url;
             const lang = document.getElementById('lang').value || 'uk';
             const clean = url.startsWith('http') ? url : 'https://' + url;
             const googleUrl = 'https://www.google.com/search?q=site:' +
                 encodeURIComponent(clean) + '&hl=' + encodeURIComponent(lang);
 
+            document.getElementById('decisionTitle').innerHTML = '&#128269; Ручна перевірка';
             document.getElementById('decisionUrl').textContent = url;
             document.getElementById('decisionCounter').textContent =
                 'Помилка ' + (recheckIdx + 1) + ' з ' + recheckQueue.length;
@@ -387,82 +457,34 @@
             }
         }
 
-        function sendManual(status) {
-            if (!currentTaskId || recheckIdx >= recheckQueue.length) return;
-
-            const idx = recheckQueue[recheckIdx];
-            const oldStatus = allResults[idx].status;
-            const commentMap = {
-                indexed: 'В індексі (підтверджено вручну)',
-                not_indexed: 'Не в індексі (підтверджено вручну)',
-                skip: 'Пропущено'
-            };
-            const realStatus = status === 'skip' ? 'error' : status;
-            const comment = commentMap[status] || '';
-
-            // Update local data
-            allResults[idx].status = realStatus;
-            allResults[idx].comment = comment;
-
-            // Update table row
-            const rows = document.getElementById('resultsBody').rows;
-            if (rows[idx]) {
-                const label = statusLabels[realStatus] || realStatus;
-                const badge = badgeClass[realStatus] || 'badge-error';
-                rows[idx].className = 'row-' + realStatus;
-                rows[idx].cells[2].innerHTML = '<span class=\"status-badge ' + badge + '\">' + label + '</span>';
-                rows[idx].cells[4].textContent = comment;
-            }
-
-            // Update counts
-            if (oldStatus === 'error') counts.error--;
-            if (realStatus === 'indexed') counts.indexed++;
-            else if (realStatus === 'not_indexed') counts.not_indexed++;
-            else counts.error++;
-            updateStats();
-
-            // Send to server
-            fetch('/manual-result/' + currentTaskId, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ index: idx, status: realStatus, comment: comment, title: '' })
-            });
-
-            // Next error URL
-            recheckIdx++;
-            showRecheckUrl();
-        }
-
-        // ── Stop ──
+        /* ── Stop ── */
         function stopCheck() {
             if (currentTaskId) {
                 fetch('/stop/' + currentTaskId, { method: 'POST' });
             }
-            if (eventSource) {
-                eventSource.close();
-                eventSource = null;
-            }
+            if (eventSource) { eventSource.close(); eventSource = null; }
             document.getElementById('decisionOverlay').classList.remove('active');
+            manualDuringCheck = false;
             if (googlePopup && !googlePopup.closed) googlePopup.close();
             googlePopup = null;
             setButtons(false);
             document.getElementById('progressText').textContent = 'Зупинено користувачем.';
         }
 
-        // ── Export ──
+        /* ── Export ── */
         function exportResults(fmt) {
             if (currentTaskId) {
                 window.location.href = '/export/' + currentTaskId + '/' + fmt;
             }
         }
 
-        // ── Helpers ──
+        /* ── Helpers ── */
         function setButtons(running) {
-            document.getElementById('btnStart').disabled = running;
-            document.getElementById('btnStop').disabled = !running;
-            document.getElementById('btnExportCsv').disabled = running || counts.total === 0;
+            document.getElementById('btnStart').disabled    = running;
+            document.getElementById('btnStop').disabled     = !running;
+            document.getElementById('btnExportCsv').disabled  = running || counts.total === 0;
             document.getElementById('btnExportXlsx').disabled = running || counts.total === 0;
-            document.getElementById('btnRecheck').disabled = running || counts.error === 0;
+            document.getElementById('btnRecheck').disabled    = running || counts.error === 0;
         }
 
         function addRow(row) {
@@ -471,30 +493,32 @@
             tr.className = 'row-' + row.status;
 
             const label = statusLabels[row.status] || row.status;
-            const badge = badgeClass[row.status] || 'badge-error';
+            const badge = badgeClass[row.status]   || 'badge-error';
 
             tr.innerHTML =
                 '<td>' + row.num + '</td>' +
-                '<td class="url-cell"><a href="' + escHtml(row.url) + '" target="_blank" rel="noopener">' + escHtml(row.url) + '</a></td>' +
+                '<td class="url-cell"><a href="' + escHtml(row.url) +
+                '" target="_blank" rel="noopener">' + escHtml(row.url) + '</a></td>' +
                 '<td><span class="status-badge ' + badge + '">' + label + '</span></td>' +
                 '<td>' + escHtml(row.title || '') + '</td>' +
                 '<td>' + escHtml(row.comment || '') + '</td>';
             tbody.appendChild(tr);
 
-            const wrap = document.getElementById('tableWrap');
-            wrap.scrollTop = wrap.scrollHeight;
+            document.getElementById('tableWrap').scrollTop =
+                document.getElementById('tableWrap').scrollHeight;
         }
 
         function updateStats() {
-            document.getElementById('statTotal').textContent = 'Перевірено: ' + counts.total;
-            document.getElementById('statIndexed').textContent = '\u2713 В індексі: ' + counts.indexed;
-            document.getElementById('statNot').textContent = '\u2717 Не в індексі: ' + counts.not_indexed;
-            document.getElementById('statError').textContent = '\u26A0 Помилки: ' + counts.error;
+            document.getElementById('statTotal').textContent   = 'Перевірено: ' + counts.total;
+            document.getElementById('statIndexed').textContent  = '\u2713 В індексі: ' + counts.indexed;
+            document.getElementById('statNot').textContent      = '\u2717 Не в індексі: ' + counts.not_indexed;
+            document.getElementById('statError').textContent    = '\u26A0 Помилки: ' + counts.error;
         }
 
         function escHtml(str) {
             if (!str) return '';
-            return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+            return str.replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         }
     </script>
 </body>
