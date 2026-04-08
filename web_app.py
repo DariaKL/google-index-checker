@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Веб-версія перевірки індексації Google
-Flask + скрапінг Google Search + SSE (Server-Sent Events)
-Якщо CAPTCHA — фронтенд відкриває popup для ручної перевірки.
+Flask + Playwright headless Chromium + SSE (Server-Sent Events)
 """
 
 import csv
@@ -17,8 +16,6 @@ import threading
 from datetime import datetime
 from urllib.parse import quote
 
-import requests as http_requests
-from bs4 import BeautifulSoup
 from flask import Flask, render_template, request, jsonify, Response, send_file
 
 try:
@@ -54,175 +51,150 @@ class CheckTask:
         self.events.append(data)
 
 
-# ── Google scraping check (like desktop version) ──
+# ── Playwright browser management ──
 
-import random as _rnd
+import queue as _queue_mod
+from playwright.sync_api import sync_playwright
 
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-]
+# ── Playwright runs in its own dedicated thread ──
+_pw_queue = _queue_mod.Queue()
+_pw_ready = threading.Event()
 
 
-def _make_session():
-    """Create a requests session that looks like a real Chrome browser."""
-    s = http_requests.Session()
-    ua = _rnd.choice(_USER_AGENTS)
-    s.headers.update({
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://www.google.com/",
-        "DNT": "1",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-    })
-    # Pre-set consent cookies to bypass GDPR page
-    s.cookies.set("CONSENT", "YES+cb.20231008-08-p0.uk+FX+684", domain=".google.com")
-    s.cookies.set("SOCS", "CAISHAgBEhJnd3NfMjAyMzEwMDgtMF9SQzIaAmVuIAEaBgiA0JyaBg",
-                  domain=".google.com")
-    return s
+def _pw_worker():
+    """Dedicated thread: owns Playwright + browser, processes jobs from queue."""
+    pw = sync_playwright().start()
+    launch_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-extensions",
+        "--disable-infobars",
+        "--single-process",
+    ]
+
+    def launch():
+        return pw.chromium.launch(headless=True, args=launch_args)
+
+    browser = launch()
+    _pw_ready.set()
+
+    while True:
+        job = _pw_queue.get()
+        if job is None:
+            break
+        url, lang, result_holder, done_event = job
+        try:
+            if not browser.is_connected():
+                browser = launch()
+            result_holder["result"] = _do_check(browser, url, lang)
+        except Exception as e:
+            err_msg = str(e)[:120]
+            result_holder["result"] = ("error", "", f"Помилка: {err_msg}")
+            # If browser crashed, relaunch for next job
+            try:
+                if not browser.is_connected():
+                    browser = launch()
+            except Exception:
+                pass
+        done_event.set()
+
+    browser.close()
+    pw.stop()
 
 
-_google_session = _make_session()
-
-
-def _do_google_request(search_url, retry=True):
-    """Send request via persistent session; retry once with new session on failure."""
-    global _google_session
-    try:
-        r = _google_session.get(search_url, timeout=15, allow_redirects=True)
-    except Exception:
-        if retry:
-            _google_session = _make_session()
-            return _do_google_request(search_url, retry=False)
-        raise
-
-    # If consent redirect — reset session & retry once
-    if retry and ("consent.google" in r.url or r.status_code == 429
-                  or "/sorry/" in r.url):
-        _google_session = _make_session()
-        time.sleep(_rnd.uniform(1, 3))
-        return _do_google_request(search_url, retry=False)
-
-    return r
-
-
-def check_indexed_scrape(url, lang="uk"):
-    """
-    Check if URL is indexed by scraping Google Search.
-    Returns (status, title, comment)
-    status: "indexed" | "not_indexed" | "error"
-    "error" covers blocks, CAPTCHAs, consent pages — no popup triggered.
-    """
+def _do_check(browser, url, lang):
+    """Run one index-check inside the Playwright thread."""
     clean = url.strip()
     if not clean.startswith(("http://", "https://")):
         clean = "https://" + clean
 
-    query = f"site:{clean}"
-    # gbv=1 — basic HTML mode, less blocking
-    search_url = (f"https://www.google.com/search?q={quote(query)}"
-                  f"&num=10&hl={quote(lang)}&gbv=1&pws=0")
+    search_url = (
+        f"https://www.google.com/search?q=site:{quote(clean)}&num=10&hl={quote(lang)}"
+    )
 
+    context = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36",
+        locale=f"{lang}-UA",
+        viewport={"width": 1280, "height": 720},
+    )
     try:
-        r = _do_google_request(search_url)
-    except http_requests.Timeout:
-        return "error", "", "Таймаут запиту до Google"
-    except Exception as e:
-        return "error", "", f"Помилка: {str(e)[:120]}"
+        context.add_cookies([
+            {"name": "CONSENT", "value": "YES+cb.20231008-08-p0.uk+FX+684",
+             "domain": ".google.com", "path": "/"},
+            {"name": "SOCS",
+             "value": "CAISHAgBEhJnd3NfMjAyMzEwMDgtMF9SQzIaAmVuIAEaBgiA0JyaBg",
+             "domain": ".google.com", "path": "/"},
+        ])
 
-    if r.status_code == 429:
-        return "error", "", "Google обмежив запити (429) — спробуйте пізніше"
+        page = context.new_page()
+        page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(2000)
+        page.wait_for_timeout(2000)  # let JS render
 
-    if r.status_code != 200:
-        return "error", "", f"HTTP {r.status_code}"
+        current_url = page.url
 
-    html = r.text
-    soup = BeautifulSoup(html, "html.parser")
-    plain = soup.get_text(" ", strip=True).lower()
+        if "/sorry/" in current_url:
+            return "error", "", "Google заблокував (CAPTCHA) — потрібна ручна перевірка"
 
-    # ── Blocked / CAPTCHA / consent → treat as error (NO popup) ──
-    current_url = r.url
-    if "/sorry/" in current_url:
-        return "error", "", "Google заблокував запит — потрібна ручна перевірка"
-    if "unusual traffic" in plain or "our systems have detected unusual" in plain:
-        return "error", "", "Google виявив незвичний трафік — потрібна ручна перевірка"
-    if "consent.google" in current_url or (
-        "before you continue" in plain and len(plain) < 500
-    ):
-        return "error", "", "Google показав сторінку згоди — потрібна ручна перевірка"
+        text = page.inner_text("body").lower()
 
-    def first_h3():
-        h3 = soup.find("h3")
-        return h3.get_text(strip=True) if h3 else ""
+        if "unusual traffic" in text or "our systems have detected unusual" in text:
+            return "error", "", "Google виявив незвичний трафік — потрібна ручна перевірка"
 
-    domain = clean.split("//")[-1].split("/")[0].replace("www.", "")
+        no_phrases = [
+            "did not match any documents",
+            "your search did not match",
+            "no results found",
+            "не відповідає жодному",
+            "не збігається жодному",
+            "жодних результатів",
+            "жодного документа",
+            "не знайдено жодного",
+            "немає результатів",
+        ]
+        for ph in no_phrases:
+            if ph in text:
+                return "not_indexed", "", "Сторінка не в індексі Google"
 
-    # ── "No results" check ──
-    no_phrases = [
-        "did not match any documents",
-        "your search did not match",
-        "no results found",
-        "не відповідає жодному",
-        "не збігається жодному",
-        "жодних результатів",
-        "жодного документа",
-        "не знайдено жодного",
-        "немає результатів",
-    ]
-    for ph in no_phrases:
-        if ph in plain:
-            return "not_indexed", "", "Сторінка не в індексі Google"
+        stats = page.query_selector("#result-stats")
+        if stats:
+            h3 = page.query_selector("h3")
+            title = h3.inner_text()[:120] if h3 else ""
+            return "indexed", title, stats.inner_text()[:120]
 
-    # ── result-stats ──
-    stats_el = soup.find(id="result-stats")
-    if stats_el:
-        return "indexed", first_h3(), stats_el.get_text(strip=True)[:120]
+        h3s = page.query_selector_all("h3")
+        if h3s:
+            title = h3s[0].inner_text()[:120] if h3s else ""
+            return "indexed", title, f"Знайдено {len(h3s)} результат(ів)"
 
-    # ── result cards ──
-    cards = soup.select("div.g, div.tF2Cxc, div[data-hveid]")
-    real = []
-    for c in cards:
-        h3 = c.find("h3")
-        a = c.find("a", href=True)
-        if h3 and a and domain in a.get("href", ""):
-            real.append(c)
-    if real:
-        h3 = real[0].find("h3")
-        return "indexed", h3.get_text(strip=True) if h3 else "", \
-               f"Знайдено {len(real)} результат(ів)"
+        if "search console" in text:
+            return "not_indexed", "", "Google рекомендує Search Console (не в індексі)"
 
-    # ── cite with domain ──
-    for cite in soup.find_all("cite"):
-        if domain in cite.get_text():
-            parent_text = ""
-            p = cite.parent
-            for _ in range(5):
-                if p is None:
-                    break
-                parent_text = p.get_text(" ", strip=True).lower()
-                if "webmasters" in parent_text or "search console" in parent_text:
-                    break
-                p = p.parent
-            else:
-                return "indexed", first_h3(), "Знайдено cite з доменом"
+        if len(text) > 500:
+            return "not_indexed", "", "Результатів не знайдено"
 
-    # ── result count in text ──
-    if re.search(r"about\s[\d,]+\sresult|[\d,]+\sresult", plain):
-        return "indexed", first_h3(), "Google показав результати"
+        return "error", "", "Не вдалося розпізнати відповідь Google"
+    finally:
+        context.close()
 
-    # ── page loaded but no signal ──
-    if "google" in plain and len(plain) > 500:
-        return "not_indexed", "", "Результатів не знайдено (можливо не в індексі)"
 
-    return "error", "", "Не вдалося розпізнати відповідь Google"
+def check_indexed_playwright(url, lang="uk"):
+    """Submit a check job to the dedicated Playwright thread and wait for result."""
+    _pw_ready.wait()
+    holder = {}
+    done = threading.Event()
+    _pw_queue.put((url, lang, holder, done))
+    done.wait(timeout=60)
+    return holder.get("result", ("error", "", "Таймаут перевірки"))
+
+
+# Start the Playwright worker thread at import time
+_pw_thread = threading.Thread(target=_pw_worker, daemon=True)
+_pw_thread.start()
 
 
 # ── Background worker ──
@@ -238,11 +210,10 @@ def run_check(task):
         task.current = i + 1
 
         try:
-            status, title, comment = check_indexed_scrape(url, task.lang)
+            status, title, comment = check_indexed_playwright(url, task.lang)
         except Exception as exc:
             status, title, comment = "error", "", str(exc)[:120]
 
-        # No popup — all results (including errors) go straight to frontend
         row = {
             "num": i + 1, "url": url, "status": status,
             "title": title, "comment": comment,
@@ -262,43 +233,6 @@ def run_check(task):
 @app.route("/")
 def index():
     return render_template("index.html")
-
-
-@app.route("/debug-google")
-def debug_google():
-    """Debug: see raw Google response from this server."""
-    test_url = request.args.get("url", "https://www.google.com")
-    lang = request.args.get("lang", "uk")
-    clean = test_url.strip()
-    if not clean.startswith(("http://", "https://")):
-        clean = "https://" + clean
-    query = f"site:{clean}"
-    search_url = f"https://www.google.com/search?q={quote(query)}&num=10&hl={quote(lang)}&gbv=1&pws=0"
-
-    info = {"search_url": search_url}
-    try:
-        r = _do_google_request(search_url)
-        info["status_code"] = r.status_code
-        info["final_url"] = r.url
-        info["headers"] = dict(r.headers)
-        soup = BeautifulSoup(r.text, "html.parser")
-        plain = soup.get_text(" ", strip=True)
-        info["text_length"] = len(plain)
-        info["text_first_2000"] = plain[:2000]
-        info["title"] = soup.title.string if soup.title else ""
-        # Check for key elements
-        info["has_result_stats"] = bool(soup.find(id="result-stats"))
-        info["h3_count"] = len(soup.find_all("h3"))
-        info["div_g_count"] = len(soup.select("div.g"))
-        info["has_sorry"] = "/sorry/" in r.url
-        info["has_consent"] = "consent.google" in r.url
-        # First 3 h3 texts
-        h3s = soup.find_all("h3")[:3]
-        info["h3_texts"] = [h.get_text(strip=True) for h in h3s]
-    except Exception as e:
-        info["error"] = str(e)
-
-    return jsonify(info)
 
 
 @app.route("/start", methods=["POST"])
@@ -334,12 +268,11 @@ def manual_result(task_id):
         return jsonify({"error": "Task not found"}), 404
 
     data = request.get_json()
-    idx = data.get("index")  # 0-based index in results
+    idx = data.get("index")
     status = data.get("status", "error")
     comment = data.get("comment", "")
     title = data.get("title", "")
 
-    # Update existing result if index provided
     if idx is not None and 0 <= idx < len(task.results):
         task.results[idx]["status"] = status
         task.results[idx]["comment"] = comment
@@ -351,7 +284,6 @@ def manual_result(task_id):
 
 @app.route("/save-results", methods=["POST"])
 def save_results():
-    """Save manually checked results for export."""
     data = request.get_json()
     results = data.get("results", [])
     if not results:
@@ -373,7 +305,7 @@ def stop_check(task_id):
         task = tasks.get(task_id)
     if task:
         task.stop_event.set()
-        task.waiting_for_manual.set()  # unblock if waiting
+        task.waiting_for_manual.set()
         return jsonify({"ok": True})
     return jsonify({"error": "Task not found"}), 404
 
