@@ -8,8 +8,10 @@ Flask + Playwright headless Chromium + SSE (Server-Sent Events)
 import csv
 import io
 import json
+import logging
 import os
 import queue as _queue_mod
+import sys
 import time
 import uuid
 import threading
@@ -18,6 +20,14 @@ from urllib.parse import quote
 
 from flask import Flask, render_template, request, jsonify, Response, send_file
 from playwright.sync_api import sync_playwright
+
+# ── Logging (visible in Render logs) ──
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger("idx")
 
 try:
     import openpyxl
@@ -56,11 +66,19 @@ class CheckTask:
 
 _pw_queue = _queue_mod.Queue()
 _pw_ready = threading.Event()
+_pw_alive = False  # True only if Chromium actually launched
 
 
 def _pw_worker():
     """Single thread owns Playwright + Chromium; all checks go through queue."""
-    pw = sync_playwright().start()
+    log.info("_pw_worker: starting Playwright...")
+    try:
+        pw = sync_playwright().start()
+    except Exception as e:
+        log.error("_pw_worker: failed to start Playwright: %s", e)
+        _pw_ready.set()  # unblock waiters so they get timeout errors
+        return
+
     launch_args = [
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -71,21 +89,38 @@ def _pw_worker():
     ]
 
     def launch():
-        return pw.chromium.launch(headless=True, args=launch_args)
+        log.info("_pw_worker: launching Chromium...")
+        b = pw.chromium.launch(headless=True, args=launch_args)
+        log.info("_pw_worker: Chromium launched OK (pid=%s)", b.contexts)
+        return b
 
-    browser = launch()
+    global _pw_alive
+    try:
+        browser = launch()
+    except Exception as e:
+        log.error("_pw_worker: Chromium launch FAILED: %s", e)
+        _pw_alive = False
+        _pw_ready.set()
+        pw.stop()
+        return
+
+    _pw_alive = True
     _pw_ready.set()
+    log.info("_pw_worker: ready, waiting for jobs...")
 
     while True:
         job = _pw_queue.get()
         if job is None:
             break
         url, lang, result_holder, done_event = job
+        log.info("_pw_worker: checking %s", url)
         try:
             if not browser.is_connected():
+                log.warning("_pw_worker: browser disconnected, relaunching...")
                 browser = launch()
             result = _do_check(browser, url, lang)
             result_holder["result"] = result
+            log.info("_pw_worker: result for %s → %s", url, result[0])
             # After CAPTCHA the browser may be corrupted → force relaunch
             if result[0] == "captcha":
                 try:
@@ -94,6 +129,7 @@ def _pw_worker():
                     pass
                 browser = launch()
         except Exception as e:
+            log.error("_pw_worker: error checking %s: %s", url, e)
             result_holder["result"] = ("error", "", f"Помилка: {str(e)[:120]}")
             try:
                 browser.close()
@@ -101,8 +137,8 @@ def _pw_worker():
                 pass
             try:
                 browser = launch()
-            except Exception:
-                pass
+            except Exception as e2:
+                log.error("_pw_worker: relaunch failed: %s", e2)
         done_event.set()
 
     browser.close()
@@ -138,8 +174,8 @@ def _do_check(browser, url, lang):
         ])
 
         page = context.new_page()
-        page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(2000)  # let JS render
+        page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(3000)  # let JS render
 
         current_url = page.url
 
@@ -204,6 +240,7 @@ def _ensure_pw_worker():
     with _pw_thread_lock:
         if _pw_thread is not None and _pw_thread.is_alive():
             return
+        log.info("_ensure_pw_worker: spawning Playwright thread...")
         _pw_ready.clear()
         _pw_thread = threading.Thread(target=_pw_worker, daemon=True)
         _pw_thread.start()
@@ -212,12 +249,20 @@ def _ensure_pw_worker():
 def check_indexed_playwright(url, lang="uk"):
     """Submit a check to the Playwright thread and wait for result."""
     _ensure_pw_worker()
-    _pw_ready.wait(timeout=30)
+    if not _pw_ready.wait(timeout=60):
+        log.error("check_indexed_playwright: Playwright not ready after 60s")
+        return ("error", "", "Playwright не запустився")
+    if not _pw_alive:
+        log.error("check_indexed_playwright: worker died (Chromium didn't launch)")
+        return ("error", "", "Chromium не запустився на сервері")
+    if _pw_thread is None or not _pw_thread.is_alive():
+        log.error("check_indexed_playwright: worker thread is dead")
+        return ("error", "", "Worker thread зупинився")
     holder = {}
     done = threading.Event()
     _pw_queue.put((url, lang, holder, done))
-    done.wait(timeout=60)
-    return holder.get("result", ("error", "", "Таймаут перевірки"))
+    done.wait(timeout=120)
+    return holder.get("result", ("error", "", "Таймаут перевірки (120с)"))
 
 
 # ── Background worker ──
@@ -390,7 +435,11 @@ def events(task_id):
             time.sleep(0.3)
 
     return Response(stream(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                        "Connection": "keep-alive",
+                    })
 
 
 @app.route("/export/<task_id>/<fmt>")
@@ -468,6 +517,33 @@ def export(task_id, fmt):
         )
 
     return jsonify({"error": "Unsupported format"}), 400
+
+
+@app.route("/health")
+def health():
+    """Diagnostic endpoint — check if Playwright + Chromium are alive."""
+    info = {
+        "pw_ready": _pw_ready.is_set(),
+        "pw_alive": _pw_alive,
+        "pw_thread": _pw_thread is not None and _pw_thread.is_alive() if _pw_thread else False,
+    }
+    # Try a quick Chromium check if worker is alive
+    if _pw_alive and _pw_thread and _pw_thread.is_alive():
+        holder = {}
+        done = threading.Event()
+        _pw_queue.put(("google.com", "uk", holder, done))
+        done.wait(timeout=90)
+        result = holder.get("result")
+        if result:
+            info["test_status"] = result[0]
+            info["test_comment"] = result[2]
+        else:
+            info["test_status"] = "timeout"
+    else:
+        info["test_status"] = "worker_not_running"
+        # Try to start worker for next time
+        _ensure_pw_worker()
+    return jsonify(info)
 
 
 if __name__ == "__main__":
