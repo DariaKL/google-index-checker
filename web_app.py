@@ -192,19 +192,32 @@ def _do_check(browser, url, lang):
         context.close()
 
 
+_pw_thread = None
+_pw_thread_lock = threading.Lock()
+
+
+def _ensure_pw_worker():
+    """Lazily start the Playwright worker thread (survives gunicorn fork)."""
+    global _pw_thread
+    if _pw_thread is not None and _pw_thread.is_alive():
+        return
+    with _pw_thread_lock:
+        if _pw_thread is not None and _pw_thread.is_alive():
+            return
+        _pw_ready.clear()
+        _pw_thread = threading.Thread(target=_pw_worker, daemon=True)
+        _pw_thread.start()
+
+
 def check_indexed_playwright(url, lang="uk"):
     """Submit a check to the Playwright thread and wait for result."""
-    _pw_ready.wait()
+    _ensure_pw_worker()
+    _pw_ready.wait(timeout=30)
     holder = {}
     done = threading.Event()
     _pw_queue.put((url, lang, holder, done))
     done.wait(timeout=60)
     return holder.get("result", ("error", "", "Таймаут перевірки"))
-
-
-# Start the Playwright worker at import time
-_pw_thread = threading.Thread(target=_pw_worker, daemon=True)
-_pw_thread.start()
 
 
 # ── Background worker ──
