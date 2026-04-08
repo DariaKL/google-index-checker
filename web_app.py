@@ -264,6 +264,43 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/debug-google")
+def debug_google():
+    """Debug: see raw Google response from this server."""
+    test_url = request.args.get("url", "https://www.google.com")
+    lang = request.args.get("lang", "uk")
+    clean = test_url.strip()
+    if not clean.startswith(("http://", "https://")):
+        clean = "https://" + clean
+    query = f"site:{clean}"
+    search_url = f"https://www.google.com/search?q={quote(query)}&num=10&hl={quote(lang)}&gbv=1&pws=0"
+
+    info = {"search_url": search_url}
+    try:
+        r = _do_google_request(search_url)
+        info["status_code"] = r.status_code
+        info["final_url"] = r.url
+        info["headers"] = dict(r.headers)
+        soup = BeautifulSoup(r.text, "html.parser")
+        plain = soup.get_text(" ", strip=True)
+        info["text_length"] = len(plain)
+        info["text_first_2000"] = plain[:2000]
+        info["title"] = soup.title.string if soup.title else ""
+        # Check for key elements
+        info["has_result_stats"] = bool(soup.find(id="result-stats"))
+        info["h3_count"] = len(soup.find_all("h3"))
+        info["div_g_count"] = len(soup.select("div.g"))
+        info["has_sorry"] = "/sorry/" in r.url
+        info["has_consent"] = "consent.google" in r.url
+        # First 3 h3 texts
+        h3s = soup.find_all("h3")[:3]
+        info["h3_texts"] = [h.get_text(strip=True) for h in h3s]
+    except Exception as e:
+        info["error"] = str(e)
+
+    return jsonify(info)
+
+
 @app.route("/start", methods=["POST"])
 def start_check():
     data = request.get_json()
