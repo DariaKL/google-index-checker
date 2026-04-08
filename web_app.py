@@ -338,6 +338,7 @@ def export(task_id, fmt):
         "not_indexed": "Не в індексі",
         "blocked": "Заблоковано",
         "error": "Помилка",
+        "skip": "Пропущено",
     }
 
     if fmt == "csv":
@@ -345,8 +346,9 @@ def export(task_id, fmt):
         writer = csv.writer(buf)
         writer.writerow(["№", "URL", "Статус", "Заголовок", "Коментар"])
         for r in task.results:
-            writer.writerow([r["num"], r["url"], label_map.get(r["status"], r["status"]),
-                             r["title"], r["comment"]])
+            writer.writerow([r.get("num", ""), r.get("url", ""),
+                             label_map.get(r.get("status", ""), r.get("status", "")),
+                             r.get("title", ""), r.get("comment", "")])
         output = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
         output.seek(0)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -367,11 +369,13 @@ def export(task_id, fmt):
         fill_map = {
             "indexed": "C8E6C9", "not_indexed": "FFCDD2",
             "blocked": "FFE0B2", "error": "FFF9C4",
+            "skip": "E0E0E0",
         }
         for r in task.results:
-            ws.append([r["num"], r["url"], label_map.get(r["status"], r["status"]),
-                       r["title"], r["comment"]])
-            color = fill_map.get(r["status"], "F5F5F5")
+            ws.append([r.get("num", ""), r.get("url", ""),
+                       label_map.get(r.get("status", ""), r.get("status", "")),
+                       r.get("title", ""), r.get("comment", "")])
+            color = fill_map.get(r.get("status", ""), "F5F5F5")
             for cell in ws[ws.max_row]:
                 cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
 
