@@ -2,33 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 Веб-версія перевірки індексації Google
-Flask + Selenium + SSE (Server-Sent Events)
+Flask + Google Custom Search API + SSE (Server-Sent Events)
 """
 
 import csv
 import io
 import json
 import os
-import re
 import time
 import uuid
 import threading
 from datetime import datetime
-from urllib.parse import quote
 
+import requests as http_requests
 from flask import Flask, render_template, request, jsonify, Response, send_file
-from bs4 import BeautifulSoup
-
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    SELENIUM_OK = True
-except ImportError:
-    SELENIUM_OK = False
 
 try:
     import openpyxl
@@ -38,6 +25,10 @@ except ImportError:
     OPENPYXL_OK = False
 
 app = Flask(__name__, template_folder="templates")
+
+# ── Config ──
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GOOGLE_CX = os.environ.get("GOOGLE_CX", "")
 
 # ── In-memory task storage ──
 tasks = {}
@@ -51,159 +42,66 @@ class CheckTask:
         self.delay_ms = delay_ms
         self.lang = lang
         self.results = []
-        self.status = "pending"  # pending | running | done | stopped
+        self.status = "pending"
         self.current = 0
         self.total = len(urls)
-        self.events = []  # SSE event queue
+        self.events = []
         self.stop_event = threading.Event()
 
     def push_event(self, data):
         self.events.append(data)
 
 
-# ── Selenium helpers ──
+# ── Google Custom Search API ──
 
-def make_driver():
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-background-timer-throttling")
-    options.add_argument("--disable-renderer-backgrounding")
-    options.add_argument("--window-size=1280,800")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/130.0.0.0 Safari/537.36"
-    )
-
-    # Use system chromedriver if available (Docker), otherwise try webdriver_manager
-    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH", "")
-    chrome_bin = os.environ.get("CHROME_BIN", "")
-
-    if chrome_bin and os.path.isfile(chrome_bin):
-        options.binary_location = chrome_bin
-
-    if chromedriver_path and os.path.isfile(chromedriver_path):
-        service = Service(chromedriver_path)
-    else:
-        try:
-            from webdriver_manager.chrome import ChromeDriverManager
-            service = Service(ChromeDriverManager().install())
-        except ImportError:
-            service = Service()  # hope chromedriver is in PATH
-
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
-    driver.set_page_load_timeout(30)
-    return driver
-
-
-def check_indexed(driver, url, lang="uk"):
+def check_indexed_api(url, lang="uk"):
+    """Check if URL is indexed using Google Custom Search API."""
     clean = url.strip()
     if not clean.startswith(("http://", "https://")):
         clean = "https://" + clean
 
     query = f"site:{clean}"
-    search_url = f"https://www.google.com/search?q={quote(query)}&num=10&hl={lang}"
-
-    driver.get(search_url)
+    api_url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": GOOGLE_API_KEY,
+        "cx": GOOGLE_CX,
+        "q": query,
+        "num": 1,
+        "hl": lang,
+    }
 
     try:
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-    except Exception:
-        pass
+        r = http_requests.get(api_url, params=params, timeout=15)
 
-    time.sleep(1.5)
+        if r.status_code == 429:
+            return "blocked", "", "API ліміт вичерпано (100/день)"
 
-    html = driver.page_source
-    soup = BeautifulSoup(html, "html.parser")
-    plain = soup.get_text(" ", strip=True).lower()
+        if r.status_code == 403:
+            data = r.json()
+            msg = data.get("error", {}).get("message", "Forbidden")
+            if "billing" in msg.lower() or "quota" in msg.lower():
+                return "blocked", "", "API ліміт вичерпано"
+            return "error", "", f"API помилка: {msg[:120]}"
 
-    # CAPTCHA / consent
-    if (
-        "/sorry/" in driver.current_url
-        or "consent.google" in driver.current_url
-        or "captcha" in plain
-        or "unusual traffic" in plain
-        or "before you continue" in plain
-    ):
-        return "blocked", "", "CAPTCHA — зупиніть і спробуйте пізніше"
+        if r.status_code != 200:
+            return "error", "", f"HTTP {r.status_code}"
 
-    def first_h3():
-        h3 = soup.find("h3")
-        return h3.get_text(strip=True) if h3 else ""
+        data = r.json()
 
-    domain = clean.split("//")[-1].split("/")[0].replace("www.", "")
+        total_results = int(data.get("searchInformation", {}).get("totalResults", "0"))
+        items = data.get("items", [])
 
-    # No results
-    no_phrases = [
-        "did not match any documents",
-        "your search did not match",
-        "no results found",
-        "не збігається жодному",
-        "жодних результатів",
-        "жодного документа",
-        "не знайдено жодного",
-        "не відповідає жодному",
-        "немає результатів",
-    ]
-    for ph in no_phrases:
-        if ph in plain:
+        if total_results == 0 and not items:
             return "not_indexed", "", "Сторінка не в індексі Google"
 
-    # result-stats
-    stats_el = soup.find(id="result-stats")
-    if stats_el:
-        return "indexed", first_h3(), stats_el.get_text(strip=True)[:120]
+        title = items[0].get("title", "") if items else ""
 
-    # result cards
-    cards = soup.select("div.g, div.tF2Cxc, div[data-hveid]")
-    real = []
-    for c in cards:
-        h3 = c.find("h3")
-        a = c.find("a", href=True)
-        if h3 and a and domain in a.get("href", ""):
-            real.append(c)
-    if real:
-        h3 = real[0].find("h3")
-        return "indexed", h3.get_text(strip=True) if h3 else "", \
-               f"Знайдено {len(real)} результат(ів)"
+        return "indexed", title, f"Знайдено результати ({total_results})"
 
-    # cite contains domain
-    for cite in soup.find_all("cite"):
-        if domain in cite.get_text():
-            parent_text = ""
-            p = cite.parent
-            for _ in range(5):
-                if p is None:
-                    break
-                parent_text = p.get_text(" ", strip=True).lower()
-                if "webmasters" in parent_text or "search console" in parent_text:
-                    break
-                p = p.parent
-            else:
-                return "indexed", first_h3(), "Знайдено cite з доменом"
-
-    # result count in text
-    if re.search(r"about\s[\d,]+\sresult|[\d,]+\sresult", plain):
-        return "indexed", first_h3(), "Google показав результати"
-
-    # no signal
-    if "google" in plain and len(plain) > 500:
-        return "not_indexed", "", "Результатів не знайдено"
-
-    return "error", "", "Не вдалося завантажити сторінку Google"
+    except http_requests.Timeout:
+        return "error", "", "Таймаут запиту до Google API"
+    except Exception as e:
+        return "error", "", f"Помилка: {str(e)[:120]}"
 
 
 # ── Background worker ──
@@ -212,43 +110,43 @@ def run_check(task):
     task.status = "running"
     task.push_event({"type": "started", "total": task.total})
 
-    try:
-        driver = make_driver()
-    except Exception as e:
+    if not GOOGLE_API_KEY or not GOOGLE_CX:
         task.status = "done"
-        task.push_event({"type": "error", "message": f"Chrome error: {e}"})
+        task.push_event({"type": "error", "message": "GOOGLE_API_KEY або GOOGLE_CX не налаштовані"})
         task.push_event({"type": "done"})
         return
 
-    try:
-        for i, url in enumerate(task.urls):
-            if task.stop_event.is_set():
-                break
+    for i, url in enumerate(task.urls):
+        if task.stop_event.is_set():
+            break
 
-            task.current = i + 1
+        task.current = i + 1
 
-            try:
-                status, title, comment = check_indexed(driver, url, task.lang)
-            except Exception as exc:
-                status, title, comment = "error", "", str(exc)[:120]
+        try:
+            status, title, comment = check_indexed_api(url, task.lang)
+        except Exception as exc:
+            status, title, comment = "error", "", str(exc)[:120]
 
+        # Stop on API limit
+        if status == "blocked" and "ліміт" in comment:
             row = {
-                "num": i + 1,
-                "url": url,
-                "status": status,
-                "title": title,
-                "comment": comment,
+                "num": i + 1, "url": url, "status": status,
+                "title": title, "comment": comment,
             }
             task.results.append(row)
             task.push_event({"type": "result", "row": row, "current": i + 1, "total": task.total})
+            task.push_event({"type": "error", "message": "API ліміт вичерпано. Зупинено."})
+            break
 
-            if i < task.total - 1 and not task.stop_event.is_set():
-                time.sleep(task.delay_ms / 1000)
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        row = {
+            "num": i + 1, "url": url, "status": status,
+            "title": title, "comment": comment,
+        }
+        task.results.append(row)
+        task.push_event({"type": "result", "row": row, "current": i + 1, "total": task.total})
+
+        if i < task.total - 1 and not task.stop_event.is_set():
+            time.sleep(task.delay_ms / 1000)
 
     task.status = "done"
     task.push_event({"type": "done"})
@@ -263,12 +161,9 @@ def index():
 
 @app.route("/start", methods=["POST"])
 def start_check():
-    if not SELENIUM_OK:
-        return jsonify({"error": "Selenium not installed"}), 500
-
     data = request.get_json()
     urls_text = data.get("urls", "")
-    delay_ms = int(data.get("delay", 3000))
+    delay_ms = int(data.get("delay", 500))
     lang = data.get("lang", "uk")
 
     lines = [ln.strip() for ln in urls_text.splitlines() if ln.strip()]
@@ -385,10 +280,5 @@ def export(task_id, fmt):
 
 
 if __name__ == "__main__":
-    os.makedirs("templates", exist_ok=True)
     port = int(os.environ.get("PORT", 5000))
-    print("=" * 50)
-    print("  Перевірка індексації Google — Веб-версія")
-    print(f"  Відкрийте: http://127.0.0.1:{port}")
-    print("=" * 50)
     app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
