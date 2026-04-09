@@ -192,9 +192,10 @@
             <h3 id="decisionTitle">&#128269; Ручна перевірка</h3>
             <div class="decision-url" id="decisionUrl"></div>
             <div class="decision-hint">
-                Перегляньте результат Google у відкритому вікні і оберіть статус:
+                Натисніть кнопку нижче щоб відкрити Google, пройдіть CAPTCHA, перевірте результат і оберіть статус:
             </div>
             <div class="decision-buttons">
+                <button class="btn" style="background:#1565c0" onclick="openGooglePopup()">&#128270; Відкрити Google</button>
                 <button class="btn btn-indexed" onclick="sendManual('indexed')">&#10003; В індексі</button>
                 <button class="btn btn-not-indexed" onclick="sendManual('not_indexed')">&#10007; Не в індексі</button>
                 <button class="btn btn-skip" onclick="sendManual('skip')">&#9193; Пропустити</button>
@@ -208,6 +209,7 @@
         let currentTaskId = null;
         let eventSource = null;
         let googlePopup = null;
+        let pendingGoogleUrl = null;  // URL to open when user clicks 'Open Google'
         let counts = { total: 0, indexed: 0, not_indexed: 0, error: 0 };
         let allResults = [];
         let recheckQueue = [];
@@ -321,14 +323,10 @@
                     document.getElementById('decisionOverlay').classList.add('active');
 
                     document.getElementById('progressText').textContent =
-                        'CAPTCHA! Перевірте URL #' + data.num + ' вручну у відкритому вікні...';
+                        'CAPTCHA! Натисніть «Відкрити Google» і перевірте URL #' + data.num + ' вручну...';
 
-                    if (googlePopup && !googlePopup.closed) {
-                        googlePopup.location.href = googleUrl;
-                    } else {
-                        googlePopup = window.open(googleUrl, 'googleCheck',
-                            'width=1000,height=700,scrollbars=yes,resizable=yes');
-                    }
+                    // Save URL for the 'Open Google' button (window.open from SSE is blocked)
+                    pendingGoogleUrl = googleUrl;
                 }
 
                 else if (data.type === 'done') {
@@ -349,6 +347,18 @@
                 eventSource = null;
                 setButtons(false);
             };
+        }
+
+        /* ── Open Google popup (called by user click — not blocked) ── */
+        function openGooglePopup() {
+            const url = pendingGoogleUrl;
+            if (!url) return;
+            if (googlePopup && !googlePopup.closed) {
+                googlePopup.location.href = url;
+            } else {
+                googlePopup = window.open(url, 'googleCheck',
+                    'width=1000,height=700,scrollbars=yes,resizable=yes');
+            }
         }
 
         /* ── Send manual decision (works both during check and post-check) ── */
@@ -449,12 +459,8 @@
                 'Помилка ' + (recheckIdx + 1) + ' з ' + recheckQueue.length;
             document.getElementById('decisionOverlay').classList.add('active');
 
-            if (googlePopup && !googlePopup.closed) {
-                googlePopup.location.href = googleUrl;
-            } else {
-                googlePopup = window.open(googleUrl, 'googleCheck',
-                    'width=1000,height=700,scrollbars=yes,resizable=yes');
-            }
+            // Save URL for the 'Open Google' button
+            pendingGoogleUrl = googleUrl;
         }
 
         /* ── Stop ── */
